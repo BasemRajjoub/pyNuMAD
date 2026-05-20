@@ -14,7 +14,7 @@ class Segment2D:
             pt1 = np.array(self.keyPts[0])
             pt2 = np.array(self.keyPts[1])
             proj = pt2 - pt1
-            steps = (1.0 / self.numEls) * np.array(range(0, nNds))
+            steps = np.linspace(0.0, 1.0, nNds) if self.numEls > 0 else np.array([0.0])
             nds = list()
             for st in steps:
                 nd = pt1 + st * proj
@@ -31,7 +31,7 @@ class Segment2D:
             kPTp = np.transpose(np.array(self.keyPts))
             numKp = len(self.keyPts)
             pKp = (1.0 / (numKp - 1)) * np.array(range(0, numKp))
-            pNds = (1.0 / self.numEls) * np.array(range(0, nNds))
+            pNds = np.linspace(0.0, 1.0, nNds) if self.numEls > 0 else np.array([0.0])
             if numKp == 2:
                 order = "linear"
             elif numKp == 3:
