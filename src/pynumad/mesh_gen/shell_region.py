@@ -114,6 +114,7 @@ class ShellRegion:
                     meshNds = mData["nodes"]
                     for ndi in range(0, xNodes):
                         minDist = 2.0
+                        minPt = meshNds[ndi]
                         for sN in segNds:
                             vec = meshNds[ndi] - sN
                             dist = np.linalg.norm(vec)
@@ -130,6 +131,7 @@ class ShellRegion:
                     meshNds = mData["nodes"]
                     for ndi in range((totNds - xNodes), totNds):
                         minDist = 2.0
+                        minPt = meshNds[ndi]
                         for sN in segNds:
                             vec = meshNds[ndi] - sN
                             dist = np.linalg.norm(vec)
@@ -146,6 +148,7 @@ class ShellRegion:
                     meshNds = mData["nodes"]
                     for ndi in range((xNodes - 1), totNds, xNodes):
                         minDist = 2.0
+                        minPt = meshNds[ndi]
                         for sN in segNds:
                             vec = meshNds[ndi] - sN
                             dist = np.linalg.norm(vec)
@@ -164,6 +167,7 @@ class ShellRegion:
                     meshNds = mData["nodes"]
                     for ndi in range(0, totNds, xNodes):
                         minDist = 2.0
+                        minPt = meshNds[ndi]
                         for sN in segNds:
                             vec = meshNds[ndi] - sN
                             dist = np.linalg.norm(vec)
