@@ -35,7 +35,7 @@ def writeAnsysDeflections(blade, config, iLoad, fid, deflectionFilename):
         fid.write('nsle,S,   \n')
         fid.write('nsel,r,loc,z,%f  \n' % (blade.ispan[i]))
         #fprintf(fid,'nsll,s,,\n');
-        if i == blade.ispan.size:
+        if i == blade.ispan.size - 1:
             fid.write('nsel,u,node,,z_master_node_number\n')
         #fprintf(fid,'nplot\n');
         fid.write('*GET, NsectionNodes, NODE,0,COUNT   !Get the number of nodes in the set\n')
