@@ -912,7 +912,7 @@ def write_ansys_shell_model(blade, meshData, config):
             fid.write('\n   sectype,%d,shell' % (secID))
             for layer in layup:
                 matid = list(blade.definition.materials.keys()).index(layer[0])
-                thickness = layer[1] / 1000
+                thickness = layer[1]  # already in metres (mesh_gen converts mm→m)
                 angle = layer[2]
                 fid.write('\n      secdata,%g,%d,%g,,' % (thickness,matid+1,angle))
             fid.write('\n   secoffset,bot\n')
@@ -928,7 +928,7 @@ def write_ansys_shell_model(blade, meshData, config):
                 fid.write('\n   sectype,%d,shell' % (secID))
                 for layer in layup:
                     matid = list(blade.definition.materials.keys()).index(layer[0])
-                    thickness = layer[1] / 1000
+                    thickness = layer[1]  # already in metres (mesh_gen converts mm→m)
                     angle = layer[2]
                     fid.write('\n      secdata,%g,%d,%g,,' % (thickness,matid+1,angle))
                 fid.write('\n   secoffset,mid\n')
