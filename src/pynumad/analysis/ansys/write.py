@@ -954,7 +954,7 @@ def write_ansys_shell_model(blade, meshData, config):
             table = np.array([0,0,np.nan]).reshape((1,-1))
         else:
             N = len(blade.ispan)
-            table = np.array([blade.ispan,blade.isweep,np.full([N,1],np.nan)])
+            table = np.vstack([blade.ispan,blade.geometry.isweep,np.full((N,),np.nan)])
         blade_struct = {}
         blade_struct["PresweepRef"] = {}
         blade_struct["PresweepRef"]["method"] = 'shear'
