@@ -576,11 +576,19 @@ def _add_spar_caps(definition, blade_structure_dict):
     if len(sparCapKeys) != 2:
         raise ValueError("Incorrect number of spar cap components")
 
+    lpSideIndex = None
+    hpSideIndex = None
     for iSparCap in range(2):
         if "suc" in blade_structure_dict[sparCapKeys[iSparCap]]["side"].lower():
             lpSideIndex = iSparCap
         if "pres" in blade_structure_dict[sparCapKeys[iSparCap]]["side"].lower():
             hpSideIndex = iSparCap
+    if lpSideIndex is None or hpSideIndex is None:
+        sides = [blade_structure_dict[k]["side"] for k in sparCapKeys]
+        raise ValueError(
+            f"Could not identify suction/pressure spar caps from sides "
+            f"{sides!r}; expected substrings 'suc' and 'pres' in `side` fields."
+        )
 
     definition.sparcapwidth_lp = (
         blade_structure_dict[sparCapKeys[lpSideIndex]]["width"]["values"] * 1000
