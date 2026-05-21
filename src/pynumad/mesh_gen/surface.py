@@ -25,7 +25,10 @@ class Surface:
         meshMethod="free",
     ):
         self.shellRegions.append(
-            ShellRegion(regType, keyPts, numEls, natSpaceCrds, elType, meshMethod)
+            ShellRegion(
+                regType, keyPts, numEls, natSpaceCrds, elType, meshMethod,
+                name=name,
+            )
         )
         if name == None:
             numReg = len(self.shellRegions)

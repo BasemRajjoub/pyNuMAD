@@ -5,6 +5,11 @@ from pynumad.mesh_gen.mesh2d import *
 import pynumad.mesh_gen.mesh_tools as mt
 import numpy as np
 
+from pynumad._logging import get_logger
+from pynumad import invariants as _inv
+
+_log = get_logger(__name__)
+
 
 class ShellRegion:
     """
@@ -13,6 +18,8 @@ class ShellRegion:
     type : str
     keyPts : list
     edgeEls : list
+    name : str
+        Optional label used in log records; defaults to "<unnamed>".
     """
 
     def __init__(
@@ -23,10 +30,14 @@ class ShellRegion:
         natSpaceCrd=[],
         elType="quad",
         meshMethod="free",
+        name=None,
     ):
         self.regType = regType
         self.keyPts = np.array(keyPoints)
         self.edgeEls = numEdgeEls
+        self.name = name if name is not None else "<unnamed>"
+        # Input validation: catches malformed callers at construction time
+        _inv.require_edge_els(numEdgeEls)
         if len(natSpaceCrd) == 0:
             if regType == "quad1":
                 self.natSpaceCrd = np.array(
@@ -88,6 +99,16 @@ class ShellRegion:
         if self.meshMethod == "structured":
             if "quad" in self.regType:
                 ee = self.edgeEls
+                _log.info(
+                    "createShellMesh: structured quad entry",
+                    extra={
+                        "stage": "structured_quad_entry",
+                        "region_name": self.name,
+                        "regType": self.regType,
+                        "edgeEls": list(ee),
+                        "edges_matched": (ee[0] == ee[2] and ee[1] == ee[3]),
+                    },
+                )
                 if ee[0] >= ee[2]:
                     xNodes = ee[0] + 1
                 else:
@@ -103,9 +124,25 @@ class ShellRegion:
                 mData = mesh.createSweptMesh(
                     "inDirection", (yNodes - 1), sweepDistance=2.0, axis=[0.0, 1.0]
                 )
+                assert mData["nodes"].shape == (totNds, 2), (
+                    f"createSweptMesh produced unexpected node count: "
+                    f"got {mData['nodes'].shape}, expected ({totNds}, 2)"
+                )
 
                 moved = False
                 if self.edgeEls[0] < self.edgeEls[2]:
+                    _log.warning(
+                        "node-pulling fired: bottom row snapped to coarser segment",
+                        extra={
+                            "stage": "node_pull",
+                            "region_name": self.name,
+                            "branch": "ee0_lt_ee2",
+                            "edgeEls": list(ee),
+                            "snap_row": "bottom",
+                            "snap_count": int(self.edgeEls[0] + 1),
+                            "row_count": int(xNodes),
+                        },
+                    )
                     seg = Segment2D(
                         "line", [[-1.0, -1.0], [1.0, -1.0]], self.edgeEls[0]
                     )
@@ -125,6 +162,18 @@ class ShellRegion:
                     mData["nodes"] = meshNds
                     moved = True
                 elif self.edgeEls[2] < self.edgeEls[0]:
+                    _log.warning(
+                        "node-pulling fired: top row snapped to coarser segment",
+                        extra={
+                            "stage": "node_pull",
+                            "region_name": self.name,
+                            "branch": "ee2_lt_ee0",
+                            "edgeEls": list(ee),
+                            "snap_row": "top",
+                            "snap_count": int(self.edgeEls[2] + 1),
+                            "row_count": int(xNodes),
+                        },
+                    )
                     seg = Segment2D("line", [[-1.0, 1.0], [1.0, 1.0]], self.edgeEls[2])
                     bnd = seg.getNodesEdges()
                     segNds = bnd["nodes"]
@@ -142,6 +191,18 @@ class ShellRegion:
                     mData["nodes"] = meshNds
                     moved = True
                 if self.edgeEls[1] < self.edgeEls[3]:
+                    _log.warning(
+                        "node-pulling fired: right column snapped to coarser segment",
+                        extra={
+                            "stage": "node_pull",
+                            "region_name": self.name,
+                            "branch": "ee1_lt_ee3",
+                            "edgeEls": list(ee),
+                            "snap_row": "right",
+                            "snap_count": int(self.edgeEls[1] + 1),
+                            "row_count": int(yNodes),
+                        },
+                    )
                     seg = Segment2D("line", [[1.0, -1.0], [1.0, 1.0]], self.edgeEls[1])
                     bnd = seg.getNodesEdges()
                     segNds = bnd["nodes"]
@@ -159,6 +220,18 @@ class ShellRegion:
                     mData["nodes"] = meshNds
                     moved = True
                 elif self.edgeEls[3] < self.edgeEls[1]:
+                    _log.warning(
+                        "node-pulling fired: left column snapped to coarser segment",
+                        extra={
+                            "stage": "node_pull",
+                            "region_name": self.name,
+                            "branch": "ee3_lt_ee1",
+                            "edgeEls": list(ee),
+                            "snap_row": "left",
+                            "snap_count": int(self.edgeEls[3] + 1),
+                            "row_count": int(yNodes),
+                        },
+                    )
                     seg = Segment2D(
                         "line", [[-1.0, 1.0], [-1.0, -1.0]], self.edgeEls[3]
                     )
@@ -179,7 +252,21 @@ class ShellRegion:
                     moved = True
 
                 if moved:
+                    _nodes_before_merge = len(mData["nodes"])
                     mData = mt.mergeDuplicateNodes(mData)
+                    _nodes_after_merge = len(mData["nodes"])
+                    _merged = _nodes_before_merge - _nodes_after_merge
+                    if _merged > 0:
+                        _log.info(
+                            "mergeDuplicateNodes merged coincident nodes",
+                            extra={
+                                "stage": "merge_duplicates",
+                                "region_name": self.name,
+                                "nodes_before": _nodes_before_merge,
+                                "nodes_after": _nodes_after_merge,
+                                "nodes_merged": int(_merged),
+                            },
+                        )
                     elLst = mData["elements"]
                     ndLst = mData["nodes"]
                     for eli in range(0, len(elLst)):
@@ -207,6 +294,35 @@ class ShellRegion:
 
                 mData["nodes"] = XYZ
                 mData["elements"] = elLst
+
+                # Post-build invariants: catch malformed mesh structure before
+                # it propagates upward. Cheap, hot-path-safe.
+                assert mData["nodes"].ndim == 2 and mData["nodes"].shape[1] == 3, (
+                    f"createShellMesh: nodes shape {mData['nodes'].shape} != (N, 3)"
+                )
+                assert mData["elements"].ndim == 2 and mData["elements"].shape[1] >= 4, (
+                    f"createShellMesh: elements shape {mData['elements'].shape} != (M, K>=4)"
+                )
+
+                # Run cheap invariants on the final mesh; log at DEBUG so
+                # users opting into JSONL get a per-region summary
+                if _log.isEnabledFor(10):  # logging.DEBUG = 10
+                    _ok, _msg = _inv.no_unreferenced_node_ids(mData)
+                    if not _ok:
+                        _log.error(
+                            "createShellMesh produced unreferenced node ids",
+                            extra={"region_name": self.name, "detail": _msg},
+                        )
+                    _log.debug(
+                        "createShellMesh exit",
+                        extra={
+                            "stage": "exit",
+                            "region_name": self.name,
+                            "n_nodes": int(mData["nodes"].shape[0]),
+                            "n_elements": int(mData["elements"].shape[0]),
+                            "moved": bool(moved),
+                        },
+                    )
                 return mData
 
             else:

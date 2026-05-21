@@ -7,6 +7,8 @@ import copy as cp
 from scipy import interpolate
 
 import pynumad
+from pynumad._logging import get_logger
+from pynumad import invariants as _inv
 from pynumad.utils.interpolation import interpolator_wrap
 
 ##from pynumad.mesh_gen.shellClasses import shellRegion, elementSet, NuMesh3D, spatialGridList2D, spatialGridList3D
@@ -18,6 +20,87 @@ from pynumad.mesh_gen.shell_region import ShellRegion
 from pynumad.mesh_gen.mesh_tools import *
 from pynumad.mesh_gen.element_utils import *
 #from pynumad.analysis.ansys.write import writeAnsysShellModel
+
+_log = get_logger(__name__)
+
+
+def _compute_edge_nels(shellKp, elementSize, region_name=""):
+    """Compute the four per-edge element counts of a shell patch from its
+    corner keypoints and the target element size.
+
+    The shell mesher derives the per-edge element count from chord length
+    divided by ``elementSize``, rounded up. When the patch is trapezoidal
+    (opposite edges of different length), the two opposite chord edges end
+    up with different counts — which fires the buggy node-pulling code in
+    ``ShellRegion.createShellMesh``. This helper centralises the
+    computation and logs every mismatch so we can grep the JSONL sidecar
+    to see which regions trigger the bug.
+
+    Parameters
+    ----------
+    shellKp : (>=4, 3) ndarray
+        Shell keypoints; only rows 0..3 (corners) are read here.
+    elementSize : float
+        Target element size in metres.
+    region_name : str
+        Optional label for the JSONL ``context.region_name`` field.
+
+    Returns
+    -------
+    nEl : (4,) ndarray of int
+        Element counts on the four edges in walk order (0->1, 1->2, 2->3, 3->0).
+    """
+    assert elementSize > 0, f"_compute_edge_nels: elementSize must be positive, got {elementSize}"
+    edge_lens = np.array(
+        [
+            np.linalg.norm(shellKp[1, :] - shellKp[0, :]),
+            np.linalg.norm(shellKp[2, :] - shellKp[1, :]),
+            np.linalg.norm(shellKp[3, :] - shellKp[2, :]),
+            np.linalg.norm(shellKp[0, :] - shellKp[3, :]),
+        ]
+    )
+    if not np.all(np.isfinite(edge_lens)):
+        _log.error(
+            "non-finite edge lengths in shell patch",
+            extra={"stage": "edge_nels", "region_name": region_name, "edge_lens": edge_lens},
+        )
+        raise ValueError(
+            f"shell patch {region_name!r} has non-finite edge lengths: {edge_lens}"
+        )
+    nEl = np.ceil(edge_lens / elementSize).astype(int)
+    # Guard against zero counts (would produce a degenerate region)
+    if np.any(nEl <= 0):
+        _log.warning(
+            "edge_nels: zero count produced, clamping to 1",
+            extra={
+                "stage": "edge_nels",
+                "region_name": region_name,
+                "edge_lens": edge_lens.tolist(),
+                "nEl_before_clamp": nEl.tolist(),
+            },
+        )
+        nEl = np.maximum(nEl, 1)
+    if nEl[0] != nEl[2] or nEl[1] != nEl[3]:
+        # This is the bug trigger — log every occurrence at WARNING so it
+        # is visible in the default-level JSONL sidecar without needing
+        # DEBUG. The Phase-4 fix will eliminate these warnings.
+        _log.warning(
+            "opposite-edge mismatch (triggers node-pulling in ShellRegion)",
+            extra={
+                "stage": "edge_nels",
+                "region_name": region_name,
+                "edge_lens": edge_lens.tolist(),
+                "nEl": nEl.tolist(),
+                "mismatch_chord": int(nEl[0] - nEl[2]),
+                "mismatch_span": int(nEl[1] - nEl[3]),
+            },
+        )
+    else:
+        _log.debug(
+            "edge_nels matched",
+            extra={"stage": "edge_nels", "region_name": region_name, "nEl": nEl.tolist()},
+        )
+    return nEl
 
 
 def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
@@ -79,17 +162,37 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
         name: 'adhesiveElements'
         labels: [0,1,2,3....(number of adhesive elements)]
     """
+    _stacks_attr = getattr(blade.stackdb, "stacks", None)
+    _swstacks_attr = getattr(blade.stackdb, "swstacks", None)
+    _log.info(
+        "shell_mesh_general entry",
+        extra={
+            "stage": "entry",
+            "elementSize": float(elementSize),
+            "forSolid": bool(forSolid),
+            "includeAdhesive": bool(includeAdhesive),
+            "stacks_shape": list(_stacks_attr.shape)
+            if isinstance(_stacks_attr, np.ndarray)
+            else (len(_stacks_attr) if _stacks_attr is not None else 0),
+            "swstacks_shape": list(_swstacks_attr.shape)
+            if isinstance(_swstacks_attr, np.ndarray)
+            else (len(_swstacks_attr) if _swstacks_attr is not None else 0),
+        },
+    )
+
     geometry = blade.geometry
     coordinates = geometry.coordinates
     profiles = geometry.profiles
     key_points = blade.keypoints.key_points
     stacks = blade.stackdb.stacks
     swstacks = blade.stackdb.swstacks
-    
+
     geomSz = coordinates.shape
     lenGeom = geomSz[0]
     numXsec = geomSz[2]
     XSCurvePts = np.array([], dtype=int)
+    assert numXsec >= 2, f"shell_mesh_general: blade has only {numXsec} cross sections"
+    assert elementSize > 0, f"shell_mesh_general: elementSize must be positive, got {elementSize}"
 
     ## Determine the key curve points along the OML at each cross section
     for i in range(numXsec):
@@ -302,44 +405,14 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
                     ],
                 ]
             )
-            # vec = shellKp[1, :] - shellKp[0, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.array([], dtype=int)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[2, :] - shellKp[1, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[3, :] - shellKp[2, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[0, :] - shellKp[3, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            
-            vec = shellKp[1, :] - shellKp[0, :]
-            mag = np.linalg.norm(vec)
-            
-            nEl1 = int(np.ceil(mag/elementSize))
-            ##
-            ## nEl1 = secNel[j]
-            ##
-            
-            vec = shellKp[2, :] - shellKp[1, :]
-            mag = np.linalg.norm(vec)
-            nEl2 = int(np.ceil(mag/elementSize))
-            vec = shellKp[3, :] - shellKp[2, :]
-            mag = np.linalg.norm(vec)
-            
-            nEl3 = int(np.ceil(mag/elementSize))
-            ##
-            ## nEl3 = secNel[j]
-            ##
-            
-            vec = shellKp[0, :] - shellKp[3, :]
-            mag = np.linalg.norm(vec)
-            nEl4 = int(np.ceil(mag/elementSize))
-            nEl = np.array([nEl1,nEl2,nEl3,nEl4])
-            
+            # Per-edge element counts: see _compute_edge_nels for the trapezoidal-
+            # patch caveat. The Sandia commented hint `nEl1 = secNel[j]` /
+            # `nEl3 = secNel[j]` suggests opposite chord edges should share a
+            # precomputed per-stack count; current code derives them per cell.
+            nEl = _compute_edge_nels(
+                shellKp, elementSize, region_name=stacks[j, i].name
+            )
+
             bladeSurf.addShellRegion(
                 "quad3",
                 shellKp,
