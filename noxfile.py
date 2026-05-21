@@ -16,6 +16,18 @@ def tests_all(session):
 
 
 @nox.session
+def tests_parallel(session):
+    """Run the full pytest suite in parallel across CPU cores via xdist.
+
+    Useful for the slow IEA-22 integration sweep where the 9 element-size
+    cases are independent and can run concurrently. Pass extra args to
+    pytest at the tail (e.g. ``nox -s tests_parallel -- -k iea22``).
+    """
+    session.install("-e", ".[test]")
+    session.run("pytest", "-n", "auto", *session.posargs)
+
+
+@nox.session
 def cov(session):
     """Run tests with coverage report on the pynumad package."""
     session.install("-e", ".[test]")
