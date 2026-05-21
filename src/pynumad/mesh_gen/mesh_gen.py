@@ -24,6 +24,15 @@ from pynumad.mesh_gen.element_utils import *
 _log = get_logger(__name__)
 
 
+# Patches whose shortest edge is below this fraction of the requested
+# elementSize are flagged as "degenerate" and skipped. Threshold chosen so
+# that legitimate small-chord regions still mesh (a tapered TE flat with
+# chord ~ 0.5 * elementSize meshes fine) but the tip/root cylinder-end
+# degeneracies (chord ~ 0.001 m on a 0.45 m elementSize, ratio ~ 0.002) get
+# caught.
+_DEGENERATE_EDGE_RATIO = 0.05
+
+
 def _compute_edge_nels(shellKp, elementSize, region_name="", force_match_opposite=True):
     """Compute the four per-edge element counts of a shell patch from its
     corner keypoints and the target element size.
@@ -80,6 +89,25 @@ def _compute_edge_nels(shellKp, elementSize, region_name="", force_match_opposit
         raise ValueError(
             f"shell patch {region_name!r} has non-finite edge lengths: {edge_lens}"
         )
+    # Detect degenerate patches (chord-zero at tip/root) before clamping.
+    # A patch whose shortest edge is < 5% of elementSize cannot be meshed
+    # without producing sliver/triangle elements that ANSYS rejects. Return
+    # None so the caller can skip this patch entirely.
+    edge_min = float(edge_lens.min())
+    if edge_min < _DEGENERATE_EDGE_RATIO * elementSize:
+        _log.warning(
+            "degenerate shell patch detected (shortest edge < threshold) — skipping",
+            extra={
+                "stage": "edge_nels",
+                "region_name": region_name,
+                "edge_lens": edge_lens.tolist(),
+                "min_edge": edge_min,
+                "threshold": _DEGENERATE_EDGE_RATIO * elementSize,
+                "ratio": edge_min / elementSize,
+            },
+        )
+        return None
+
     nEl_raw = np.ceil(edge_lens / elementSize).astype(int)
     # Guard against zero counts (would produce a degenerate region)
     if np.any(nEl_raw <= 0):
@@ -447,6 +475,11 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
             nEl = _compute_edge_nels(
                 shellKp, elementSize, region_name=stacks[j, i].name
             )
+            if nEl is None:
+                # Degenerate patch (e.g. zero-chord at root/tip cylinder).
+                # _compute_edge_nels already logged the skip.
+                stSp = stSp + 3
+                continue
 
             bladeSurf.addShellRegion(
                 "quad3",
@@ -543,30 +576,30 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
             # Per-edge element counts via the central helper, which also
             # forces opposite-edge equality to avoid the node-pulling bug.
             nEl = _compute_edge_nels(
-                shellKp, elementSize, region_name="<shear_web>"
+                shellKp, elementSize, region_name=swstacks[0][i].name
             )
-
-            bladeSurf.addShellRegion(
-                "quad3",
-                shellKp,
-                nEl,
-                name=swstacks[0][i].name,
-                elType="quad",
-                meshMethod="structured",
-            )
-            swES.add(swstacks[0][i].name)
-            newSec = dict()
-            newSec["type"] = "shell"
-            layup = list()
-            for pg in swstacks[0][i].plygroups:
-                totThick = 0.001*pg.thickness * pg.nPlies
-                ply = [pg.materialid, totThick, pg.angle]
-                layup.append(ply)
-            newSec["layup"] = layup
-            newSec["elementSet"] = swstacks[0][i].name
-            newSec["xDir"] = np.array([0.0,0.0,1.0])
-            newSec["xyDir"] = (shellKp[1,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[3,:])
-            secList.append(newSec)
+            if nEl is not None:
+                bladeSurf.addShellRegion(
+                    "quad3",
+                    shellKp,
+                    nEl,
+                    name=swstacks[0][i].name,
+                    elType="quad",
+                    meshMethod="structured",
+                )
+                swES.add(swstacks[0][i].name)
+                newSec = dict()
+                newSec["type"] = "shell"
+                layup = list()
+                for pg in swstacks[0][i].plygroups:
+                    totThick = 0.001*pg.thickness * pg.nPlies
+                    ply = [pg.materialid, totThick, pg.angle]
+                    layup.append(ply)
+                newSec["layup"] = layup
+                newSec["elementSet"] = swstacks[0][i].name
+                newSec["xDir"] = np.array([0.0,0.0,1.0])
+                newSec["xyDir"] = (shellKp[1,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[3,:])
+                secList.append(newSec)
         if swstacks[1][i].plygroups:
             shellKp = np.zeros((16, 3))
             shellKp[0, :] = np.array(
@@ -605,30 +638,30 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
             # Per-edge element counts via the central helper, which also
             # forces opposite-edge equality to avoid the node-pulling bug.
             nEl = _compute_edge_nels(
-                shellKp, elementSize, region_name="<shear_web>"
+                shellKp, elementSize, region_name=swstacks[1][i].name
             )
-
-            bladeSurf.addShellRegion(
-                "quad3",
-                shellKp,
-                nEl,
-                name=swstacks[1][i].name,
-                elType="quad",
-                meshMethod="structured",
-            )
-            swES.add(swstacks[1][i].name)
-            newSec = dict()
-            newSec["type"] = "shell"
-            layup = list()
-            for pg in swstacks[1][i].plygroups:
-                totThick = 0.001*pg.thickness * pg.nPlies
-                ply = [pg.materialid, totThick, pg.angle]
-                layup.append(ply)
-            newSec["layup"] = layup
-            newSec["elementSet"] = swstacks[1][i].name
-            newSec["xDir"] = np.array([0.0,0.0,1.0])
-            newSec["xyDir"] = (shellKp[1,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[3,:])
-            secList.append(newSec)
+            if nEl is not None:
+                bladeSurf.addShellRegion(
+                    "quad3",
+                    shellKp,
+                    nEl,
+                    name=swstacks[1][i].name,
+                    elType="quad",
+                    meshMethod="structured",
+                )
+                swES.add(swstacks[1][i].name)
+                newSec = dict()
+                newSec["type"] = "shell"
+                layup = list()
+                for pg in swstacks[1][i].plygroups:
+                    totThick = 0.001*pg.thickness * pg.nPlies
+                    ply = [pg.materialid, totThick, pg.angle]
+                    layup.append(ply)
+                newSec["layup"] = layup
+                newSec["elementSet"] = swstacks[1][i].name
+                newSec["xDir"] = np.array([0.0,0.0,1.0])
+                newSec["xyDir"] = (shellKp[1,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[3,:])
+                secList.append(newSec)
         stPt = stPt + 3
 
     ## Generate Shell mesh
