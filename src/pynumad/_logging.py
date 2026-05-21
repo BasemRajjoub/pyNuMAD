@@ -54,6 +54,13 @@ from datetime import datetime
 from logging import Logger
 from typing import Any
 
+__all__ = [
+    "JsonlFormatter",
+    "get_logger",
+    "enable_jsonl_sidecar",
+    "disable_jsonl_sidecar",
+]
+
 # Reserved attribute names on logging.LogRecord — anything in `extra` whose
 # key matches one of these would raise KeyError. We collect everything else
 # into a `context` dict.

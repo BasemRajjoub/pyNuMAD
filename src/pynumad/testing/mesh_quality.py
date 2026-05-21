@@ -26,6 +26,23 @@ from typing import Iterable
 
 import numpy as np
 
+__all__ = [
+    "MeshQualityReport",
+    "DEFAULT_MIN_JACOBIAN_RATIO",
+    "DEFAULT_MAX_ASPECT_RATIO",
+    "quad_edge_lengths",
+    "quad_aspect_ratio",
+    "quad_warp_factor",
+    "quad_has_jacobian_flip",
+    "quad_min_jacobian",
+    "find_coincident_node_pairs",
+    "analyse_mesh",
+    "assert_mesh_clean",
+    "assert_no_jacobian_flips",
+    "assert_no_jacobian_pathology",
+    "select_elements_in_z_band",
+]
+
 # ----- low-level metrics on a single quad ----------------------------------
 
 _EPS = 1e-12

@@ -35,6 +35,12 @@ import numpy as np
 
 from pynumad.testing.mesh_quality import analyse_mesh
 
+__all__ = [
+    "write_mesh_html",
+    "write_mesh_png",
+    "dump_mesh_views",
+]
+
 
 def _build_face_triangles(nodes: np.ndarray, elements: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Split each quad into 2 triangles; pass-through triangles.

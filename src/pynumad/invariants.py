@@ -23,6 +23,23 @@ from collections.abc import Sequence
 
 import numpy as np
 
+__all__ = [
+    # edgeEls
+    "check_edge_els",
+    "require_edge_els",
+    "opposite_edges_match",
+    # quad corners
+    "check_quad_corners",
+    "quad_signed_area_in_plane",
+    "quad_is_positive_jacobian",
+    "require_quad_positive_jacobian",
+    # mesh dict
+    "check_mesh_dict",
+    "no_unreferenced_node_ids",
+    "no_negative_node_ids_except_sentinel",
+    "quad_elements_have_distinct_first_three_nodes",
+]
+
 # ---------------------------------------------------------------------------
 # edgeEls / region geometry invariants
 # ---------------------------------------------------------------------------

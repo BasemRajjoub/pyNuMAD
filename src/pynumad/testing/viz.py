@@ -21,6 +21,12 @@ from typing import Iterable, Sequence
 
 import numpy as np
 
+__all__ = [
+    "write_quad_svg",
+    "write_neighbourhood_svg",
+    "dump_bad_elements",
+]
+
 
 _EPS = 1e-15
 
