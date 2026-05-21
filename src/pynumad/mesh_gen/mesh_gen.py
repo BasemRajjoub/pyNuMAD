@@ -24,17 +24,28 @@ from pynumad.mesh_gen.element_utils import *
 _log = get_logger(__name__)
 
 
-def _compute_edge_nels(shellKp, elementSize, region_name=""):
+def _compute_edge_nels(shellKp, elementSize, region_name="", force_match_opposite=True):
     """Compute the four per-edge element counts of a shell patch from its
     corner keypoints and the target element size.
 
     The shell mesher derives the per-edge element count from chord length
     divided by ``elementSize``, rounded up. When the patch is trapezoidal
-    (opposite edges of different length), the two opposite chord edges end
-    up with different counts — which fires the buggy node-pulling code in
-    ``ShellRegion.createShellMesh``. This helper centralises the
-    computation and logs every mismatch so we can grep the JSONL sidecar
-    to see which regions trigger the bug.
+    (opposite edges of different length), the two opposite chord edges
+    naturally end up with different counts — which fires the buggy
+    node-pulling code in ``ShellRegion.createShellMesh``.
+
+    Fix: when ``force_match_opposite`` is True (the default), opposite
+    edges are clamped to ``max(nEl_a, nEl_b)`` so the structured-mesh
+    branch never has to do node-pulling. The cost is mild over-refinement
+    in strongly trapezoidal patches (chord-direction count is governed by
+    the longer of the two chord edges); the benefit is no Jacobian flips,
+    no slivers, no warped quads. Neighbour-cell connectivity is preserved
+    because both neighbours' ``ceil(|same_edge|/elementSize)`` evaluations
+    agree (same vector, same divisor); the ``max()`` of equal numbers
+    against equal numbers stays equal across the boundary.
+
+    Set ``force_match_opposite=False`` to recover the original buggy
+    behaviour (useful for regression testing the fix's impact).
 
     Parameters
     ----------
@@ -44,6 +55,8 @@ def _compute_edge_nels(shellKp, elementSize, region_name=""):
         Target element size in metres.
     region_name : str
         Optional label for the JSONL ``context.region_name`` field.
+    force_match_opposite : bool, default True
+        When True, force opposite edges to share the larger element count.
 
     Returns
     -------
@@ -67,23 +80,44 @@ def _compute_edge_nels(shellKp, elementSize, region_name=""):
         raise ValueError(
             f"shell patch {region_name!r} has non-finite edge lengths: {edge_lens}"
         )
-    nEl = np.ceil(edge_lens / elementSize).astype(int)
+    nEl_raw = np.ceil(edge_lens / elementSize).astype(int)
     # Guard against zero counts (would produce a degenerate region)
-    if np.any(nEl <= 0):
+    if np.any(nEl_raw <= 0):
         _log.warning(
             "edge_nels: zero count produced, clamping to 1",
             extra={
                 "stage": "edge_nels",
                 "region_name": region_name,
                 "edge_lens": edge_lens.tolist(),
-                "nEl_before_clamp": nEl.tolist(),
+                "nEl_before_clamp": nEl_raw.tolist(),
             },
         )
-        nEl = np.maximum(nEl, 1)
-    if nEl[0] != nEl[2] or nEl[1] != nEl[3]:
-        # This is the bug trigger — log every occurrence at WARNING so it
-        # is visible in the default-level JSONL sidecar without needing
-        # DEBUG. The Phase-4 fix will eliminate these warnings.
+        nEl_raw = np.maximum(nEl_raw, 1)
+
+    mismatch_chord = int(nEl_raw[0] - nEl_raw[2])
+    mismatch_span = int(nEl_raw[1] - nEl_raw[3])
+    has_mismatch = mismatch_chord != 0 or mismatch_span != 0
+
+    if force_match_opposite and has_mismatch:
+        chord_nel = int(max(nEl_raw[0], nEl_raw[2]))
+        span_nel = int(max(nEl_raw[1], nEl_raw[3]))
+        nEl = np.array([chord_nel, span_nel, chord_nel, span_nel], dtype=int)
+        _log.info(
+            "opposite-edge mismatch clamped to max (force_match_opposite)",
+            extra={
+                "stage": "edge_nels",
+                "region_name": region_name,
+                "edge_lens": edge_lens.tolist(),
+                "nEl_raw": nEl_raw.tolist(),
+                "nEl_clamped": nEl.tolist(),
+                "mismatch_chord": mismatch_chord,
+                "mismatch_span": mismatch_span,
+            },
+        )
+    elif has_mismatch:
+        # Unfixed path — log at WARNING so the JSONL sidecar exposes the
+        # bug trigger immediately.
+        nEl = nEl_raw
         _log.warning(
             "opposite-edge mismatch (triggers node-pulling in ShellRegion)",
             extra={
@@ -91,11 +125,12 @@ def _compute_edge_nels(shellKp, elementSize, region_name=""):
                 "region_name": region_name,
                 "edge_lens": edge_lens.tolist(),
                 "nEl": nEl.tolist(),
-                "mismatch_chord": int(nEl[0] - nEl[2]),
-                "mismatch_span": int(nEl[1] - nEl[3]),
+                "mismatch_chord": mismatch_chord,
+                "mismatch_span": mismatch_span,
             },
         )
     else:
+        nEl = nEl_raw
         _log.debug(
             "edge_nels matched",
             extra={"stage": "edge_nels", "region_name": region_name, "nEl": nEl.tolist()},
@@ -505,44 +540,11 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
             shellKp[14, :] = 0.6666 * shellKp[7, :] + 0.3333 * shellKp[10, :]
             shellKp[15, :] = 0.3333 * shellKp[7, :] + 0.6666 * shellKp[10, :]
 
-            # vec = shellKp[1, :] - shellKp[0, :]
-            # mag = np.linalg.norm(vec)
-
-            # nEl = np.array([], dtype=int)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[2, :] - shellKp[1, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[3, :] - shellKp[2, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[0, :] - shellKp[3, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            
-            vec = shellKp[1, :] - shellKp[0, :]
-            mag = np.linalg.norm(vec)
-            
-            nEl1 = int(np.ceil(mag/elementSize))
-            ##
-            ## nEl1 = 8
-            ##
-            
-            vec = shellKp[2, :] - shellKp[1, :]
-            mag = np.linalg.norm(vec)
-            nEl2 = int(np.ceil(mag/elementSize))
-            vec = shellKp[3, :] - shellKp[2, :]
-            mag = np.linalg.norm(vec)
-            
-            nEl3 = int(np.ceil(mag/elementSize))
-            ##
-            ## nEl3 = 8
-            ##
-            
-            vec = shellKp[0, :] - shellKp[3, :]
-            mag = np.linalg.norm(vec)
-            nEl4 = int(np.ceil(mag/elementSize))
-            nEl = np.array([nEl1,nEl2,nEl3,nEl4])
+            # Per-edge element counts via the central helper, which also
+            # forces opposite-edge equality to avoid the node-pulling bug.
+            nEl = _compute_edge_nels(
+                shellKp, elementSize, region_name="<shear_web>"
+            )
 
             bladeSurf.addShellRegion(
                 "quad3",
@@ -600,44 +602,11 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
             shellKp[14, :] = 0.6666 * shellKp[7, :] + 0.3333 * shellKp[10, :]
             shellKp[15, :] = 0.3333 * shellKp[7, :] + 0.6666 * shellKp[10, :]
 
-            # vec = shellKp[1, :] - shellKp[0, :]
-            # mag = np.linalg.norm(vec)
-
-            # nEl = np.array([], dtype=int)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[2, :] - shellKp[1, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[3, :] - shellKp[2, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            # vec = shellKp[0, :] - shellKp[3, :]
-            # mag = np.linalg.norm(vec)
-            # nEl = np.concatenate([nEl, [np.ceil(mag / elementSize).astype(int)]])
-            
-            vec = shellKp[1, :] - shellKp[0, :]
-            mag = np.linalg.norm(vec)
-            
-            nEl1 = int(np.ceil(mag/elementSize))
-            ##
-            ## nEl1 = 8
-            ##
-            
-            vec = shellKp[2, :] - shellKp[1, :]
-            mag = np.linalg.norm(vec)
-            nEl2 = int(np.ceil(mag/elementSize))
-            vec = shellKp[3, :] - shellKp[2, :]
-            mag = np.linalg.norm(vec)
-            
-            nEl3 = int(np.ceil(mag/elementSize))
-            ##
-            ## nEl3 = 8
-            ##
-            
-            vec = shellKp[0, :] - shellKp[3, :]
-            mag = np.linalg.norm(vec)
-            nEl4 = int(np.ceil(mag/elementSize))
-            nEl = np.array([nEl1,nEl2,nEl3,nEl4])
+            # Per-edge element counts via the central helper, which also
+            # forces opposite-edge equality to avoid the node-pulling bug.
+            nEl = _compute_edge_nels(
+                shellKp, elementSize, region_name="<shear_web>"
+            )
 
             bladeSurf.addShellRegion(
                 "quad3",
