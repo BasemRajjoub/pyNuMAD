@@ -20,19 +20,29 @@ maintainers = [
 requires-python = ">=3.8"
 
 dependencies = [
-  "numpy", 
-  "scipy", 
-  "pandas", 
-  "matplotlib", 
-  "pyyaml", 
-  "plotly", 
+  "numpy",
+  "scipy",
+  "pandas",
+  "matplotlib",
+  "pyyaml",
+  "plotly",
   "openpyxl",
-  ]
+]
 
-# [project.optional-dependencies]
-# test = [
-#   "pytest >=6.0",
-# ]
+[project.optional-dependencies]
+test = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "hypothesis>=6.0",
+]
+dev = [
+  "pytest>=7.0",
+  "pytest-cov>=4.0",
+  "hypothesis>=6.0",
+  "ruff>=0.4.0",
+  "mypy>=1.8",
+  "nox>=2024.0",
+]
 
 classifiers = [
   "License :: OSI Approved :: BSD License",
@@ -58,3 +68,62 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["src/pynumad/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+  "-ra",
+  "--strict-markers",
+  "--strict-config",
+]
+markers = [
+  "slow: tests that take more than a few seconds (deselect with '-m \"not slow\"')",
+  "integration: full-pipeline tests that build a real blade mesh",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["src/pynumad"]
+branch = true
+omit = [
+  "src/pynumad/tests/*",
+  "src/pynumad/graphics/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+line-length = 140
+target-version = "py38"
+extend-exclude = ["docs", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = [
+  "E501",  # line too long (handled by formatter)
+  "E741",  # ambiguous variable name (numpy code uses l, I, O often)
+]
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = false
+warn_unused_configs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+check_untyped_defs = false
+disallow_untyped_defs = false
+follow_imports = "silent"
+exclude = [
+  "src/pynumad/tests/",
+  "examples/",
+]
