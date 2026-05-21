@@ -304,7 +304,14 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
     geomSz = coordinates.shape
     lenGeom = geomSz[0]
     numXsec = geomSz[2]
-    XSCurvePts = np.array([], dtype=int)
+    # XSCurvePts stores fractional indices into the chord-direction
+    # geometry curve at each station. Float dtype (not int) so that when
+    # consecutive design keypoints are < 3 geometry-indices apart (typical
+    # at root cylinder transition and tip taper), the linspace subdivision
+    # below produces strictly monotonic samples instead of collisions
+    # from np.round(). Fractional indices are resolved via np.interp on
+    # the coordinates array.
+    XSCurvePts = np.array([], dtype=float)
     assert numXsec >= 2, f"shell_mesh_general: blade has only {numXsec} cross sections"
     assert elementSize > 0, f"shell_mesh_general: elementSize must be positive, got {elementSize}"
 
@@ -350,27 +357,45 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
             coordinates[pti, :, i] = np.array(kpCrd)
 
         keyPts = np.concatenate((keyPts, [lenGeom - 1]))
-        allPts = np.array([keyPts[0]])
+        allPts = np.array([float(keyPts[0])])
         for j in range(0, len(keyPts) - 1):
-            secPts = np.linspace(keyPts[j], keyPts[j + 1], 4)
-            secPts = np.round(secPts).astype(int)
+            # 4 fractional samples between consecutive key indices. NO
+            # rounding: the downstream lookup uses np.interp so fractional
+            # values are well-defined, and we avoid the collision pattern
+            # that np.round(linspace) produces when keyPts are < 3 apart
+            # (root cylinder / tip taper regions).
+            secPts = np.linspace(float(keyPts[j]), float(keyPts[j + 1]), 4)
             allPts = np.concatenate((allPts, secPts[1:4]))
 
         XSCurvePts = np.vstack((XSCurvePts, allPts)) if XSCurvePts.size else allPts
     rws, cls = XSCurvePts.shape
 
     ## Create longitudinal splines down the blade through each of the key X-section points
+    # `coordinates[:, :, i]` is a (lenGeom, 3) chord-direction polyline at
+    # station i. We evaluate it at the fractional indices XSCurvePts[i, :]
+    # via linear interpolation. This guarantees that consecutive entries of
+    # XSCurvePts produce DISTINCT 3D points whenever the underlying chord
+    # curve has any extent — eliminating the duplicate-keypoint pathology
+    # at the root and tip.
+    _geom_idx = np.arange(lenGeom, dtype=float)
 
-    splineX = coordinates[XSCurvePts[0, :], 0, 0]
-    splineY = coordinates[XSCurvePts[0, :], 1, 0]
-    splineZ = coordinates[XSCurvePts[0, :], 2, 0]
+    def _interp_station(station_idx: int) -> np.ndarray:
+        """Return (cls, 3) interpolated coords for station `station_idx`."""
+        xp = XSCurvePts[station_idx, :]
+        out = np.empty((xp.shape[0], 3), dtype=float)
+        for axis in range(3):
+            out[:, axis] = np.interp(xp, _geom_idx, coordinates[:, axis, station_idx])
+        return out
+
+    _station0 = _interp_station(0)
+    splineX = _station0[:, 0]
+    splineY = _station0[:, 1]
+    splineZ = _station0[:, 2]
     for i in range(1, rws):
-        Xrow = coordinates[XSCurvePts[i, :], 0, i]
-        splineX = np.vstack((splineX, Xrow.T))
-        Yrow = coordinates[XSCurvePts[i, :], 1, i]
-        splineY = np.vstack((splineY, Yrow.T))
-        Zrow = coordinates[XSCurvePts[i, :], 2, i]
-        splineZ = np.vstack((splineZ, Zrow.T))
+        _row = _interp_station(i)
+        splineX = np.vstack((splineX, _row[:, 0].T))
+        splineY = np.vstack((splineY, _row[:, 1].T))
+        splineZ = np.vstack((splineZ, _row[:, 2].T))
 
     spParam = np.transpose(np.linspace(0, 1, rws))
     nSpi = rws + 2 * (rws - 1)
