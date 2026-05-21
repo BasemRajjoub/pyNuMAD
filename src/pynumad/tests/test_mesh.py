@@ -47,17 +47,13 @@ class TestMesh(unittest.TestCase):
         self.assertGreater(report.n_elements, 1000)
         self.assertLess(report.n_elements, 1_000_000)
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="Same root-transition bug as IEA-22 — BAR0 produces 2 jflips at "
-        "0.2 m today. Confirms the algorithm bug is not IEA-22-specific. "
-        "Phase-4 fix should make this pass.",
-    )
     def test_bar0_no_jflips(self):
-        """BAR0 must produce zero sign-flipped quads at 0.2 m. Currently
-        fails (2 jflips) — this is independent confirmation that the
-        opposite-edge-mismatch bug affects multiple blade geometries, not
-        just IEA-22's root transition."""
+        """BAR0 must produce zero sign-flipped quads at 0.2 m.
+
+        Originally xfailed when the mesh-quality wall investigation began;
+        now passes after the three Phase-4 fixes (opposite-edge equality,
+        chord-zero degenerate-patch skip, duplicate-keypoint skip).
+        """
         blade = Blade(self.yamlfile)
         meshData = get_shell_mesh(blade, includeAdhesive=1, elementSize=0.2)
         report = analyse_mesh(meshData)

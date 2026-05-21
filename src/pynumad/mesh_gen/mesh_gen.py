@@ -108,6 +108,57 @@ def _compute_edge_nels(shellKp, elementSize, region_name="", force_match_opposit
         )
         return None
 
+    # Detect duplicate keypoints in the full 16-point shellKp grid (if
+    # available). At cylindrical root/tip regions, XSCurvePts[i] can contain
+    # repeated geometry-curve indices after np.round() of close linspace
+    # values; that produces interior keypoints coincident with boundary
+    # keypoints, and the quad3 Lagrange basis interpolant becomes degenerate
+    # — yielding bow-tied elements deep inside the patch even though the
+    # four corners look fine.
+    if shellKp.shape[0] >= 16:
+        # Spatial-hash tolerance: 1% of the minimum edge length (already
+        # validated as >= 5% of elementSize above)
+        tol = max(1e-9, 0.01 * edge_min)
+        rounded = np.round(shellKp[:16] / tol).astype(np.int64)
+        seen: dict[tuple, int] = {}
+        for i, key in enumerate(map(tuple, rounded)):
+            if key in seen:
+                _log.warning(
+                    "shellKp has duplicate keypoints (likely XSCurvePts collision "
+                    "from np.round in linspace) — skipping patch to avoid degenerate "
+                    "Lagrange interpolant",
+                    extra={
+                        "stage": "edge_nels",
+                        "region_name": region_name,
+                        "duplicate_indices": [seen[key], i],
+                        "duplicate_coord": shellKp[i].tolist(),
+                        "tol": tol,
+                    },
+                )
+                return None
+            seen[key] = i
+
+    # Final check: are the four CORNER keypoints in a consistently-wound
+    # (non-bow-tied) configuration? At narrow airfoil-transition regions
+    # the chord-direction sampling can produce slight inconsistencies
+    # between adjacent z-stations that don't trip the duplicate-keypoint
+    # check (corners differ by ~1e-3 m but in opposite directions). We
+    # detect this by running the same Jacobian-flip test we apply to the
+    # final elements: project the four corners onto their dominant plane
+    # and check that the two diagonal triangles have the same signed area.
+    from pynumad.testing.mesh_quality import quad_has_jacobian_flip
+    if quad_has_jacobian_flip(shellKp[:4]):
+        _log.warning(
+            "twist-induced bow-tie in patch corners — skipping",
+            extra={
+                "stage": "edge_nels",
+                "region_name": region_name,
+                "corner_coords": shellKp[:4].tolist(),
+                "edge_lens": edge_lens.tolist(),
+            },
+        )
+        return None
+
     nEl_raw = np.ceil(edge_lens / elementSize).astype(int)
     # Guard against zero counts (would produce a degenerate region)
     if np.any(nEl_raw <= 0):

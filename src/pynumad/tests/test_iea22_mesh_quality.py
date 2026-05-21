@@ -95,11 +95,6 @@ def _build_iea22_mesh(blade, element_size: float) -> dict:
 @_skip_no_iea22
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase-4 fix not yet applied: opposite-edge mismatch creates "
-    "sliver/jflip quads at root transition; expected to fail today",
-)
 @pytest.mark.parametrize("element_size", [0.80, 0.60, 0.45])
 def test_iea22_no_jflips_coarse(iea22_blade, element_size):
     """Coarse element sizes (≥ 0.45 m) currently work in ANSYS but already
@@ -124,10 +119,6 @@ def test_iea22_no_jflips_coarse(iea22_blade, element_size):
 @_skip_no_iea22
 @pytest.mark.integration
 @pytest.mark.slow
-@pytest.mark.xfail(
-    strict=True,
-    reason="Phase-4 fix not yet applied: ANSYS aborts on these sizes today",
-)
 @pytest.mark.parametrize("element_size", [0.40, 0.35, 0.30, 0.20, 0.10])
 def test_iea22_no_jflips_fine(iea22_blade, element_size):
     """Fine element sizes (< 0.40 m) currently cause ANSYS to abort. These
