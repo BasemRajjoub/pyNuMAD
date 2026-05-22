@@ -1,25 +1,26 @@
-"""Regression baseline for chord-group connectivity on BAR0.
+"""Regression test for chord-group connectivity on BAR0.
 
-What this test does NOT do: assert that every chord group is a single
-connected component. pyNuMAD's shell meshes are T-junction-based by
-design — chord regions share corner nodes with their neighbours but
-seldom edges. ANSYS handles the T-junctions via the constraint
-equations pyNuMAD emits.
+Every per-material chord group on the blade outer shell (HP_SPAR,
+HP_TE_REINF, HP_LE, HP_TE_PANEL, …) must form **exactly one
+node-connected component**. That is the weakest possible
+"plate-like" continuity property: every element of the group shares
+at least one node with another element of the same group. Anything
+weaker means the group has isolated islands that can't transfer load
+through their own kinematics.
 
-What this test DOES do: pin down the *current* node-component count
-for each chord group as a snapshot. If a future pyNuMAD change makes
-the spar caps fragment unexpectedly (or makes HP_TE_REINF stop
-fragmenting), this test alerts and the snapshot has to be updated
-deliberately. That makes it a guard against silent regressions in
-either direction.
+Shear webs are the only intentional exception — they are N physical
+components, one per web in the windIO definition.
 
-The HP/LP asymmetry observed at the trailing edge (``HP_TE_REINF``
-fragments to ~half the elements while ``LP_TE_REINF`` stays at 1) is
-a real artefact of the keypoint-clamp asymmetry in
-``pynumad/objects/keypoints.py`` (lines 203 vs 249). Closing that
-asymmetry is a separate, multi-day refactor and is intentionally not
-attempted here — but if anybody DOES fix it, this test will tell them
-the HP side just became symmetric with LP.
+History note: an earlier version of this test treated set labels as
+1-indexed and saw HP_TE_REINF fragment into ~100 components. That
+was a bug in the test, not the mesh — labels in
+``mesh["sets"]["element"][...]["labels"]`` are 0-indexed (the ANSYS
+deck writer in ``analysis/ansys/write.py:1272`` adds ``+1`` on its
+own when emitting EMODIF). With correct indexing every chord group
+is a single node-component, and almost all are single edge-components
+too. The few that aren't edge-connected (panels, TE_FLAT) form
+T-junctions that ANSYS handles via the pyNuMAD-emitted constraint
+equations.
 """
 from __future__ import annotations
 
@@ -34,55 +35,37 @@ def bar0_mesh():
     return get_mesh(includeAdhesive=False, elementSize=0.5)
 
 
-# Groups that MUST be 1-piece by node-connectivity. The LP side and the
-# spar caps satisfy this on every blade we ship; the HP side TE_REINF
-# does not yet (see module docstring) so it's deliberately omitted.
-ALWAYS_ONE_PIECE_GROUPS = {
-    "HP_SPAR",
-    "LP_SPAR",
-    "LP_LE",
-    "LP_TE_REINF",
-}
+# Every chord group should be a single node-connected component.
+# Shear webs (SW) are excluded because they are intentionally multiple
+# physical components.
+EXPECTED_NODE_CC = {tag: 1 for tag in mc.CHORD_GROUP_TAGS if tag != "SW"}
 
 
-def test_canonical_groups_are_node_connected(bar0_mesh):
-    """Spars + LP side should be one node-connected piece on BAR0."""
+def test_all_chord_groups_are_node_connected(bar0_mesh):
+    """Every material zone (except SW) should be a single 'plate'."""
     sizes = mc.all_group_components(bar0_mesh, min_shared_nodes=1)
-    for tag in ALWAYS_ONE_PIECE_GROUPS:
+    for tag, n_expected in EXPECTED_NODE_CC.items():
         cc = sizes.get(tag, [])
         assert cc, f"{tag} missing from mesh"
-        assert len(cc) == 1, (
-            f"{tag}: expected 1 node-connected component, got {len(cc)} "
-            f"(sizes={cc[:5]}...)"
+        assert len(cc) == n_expected, (
+            f"{tag}: expected {n_expected} node-connected component(s), "
+            f"got {len(cc)} (sizes={cc[:5]}...)"
         )
 
 
-# HP/LP asymmetry baseline. The HP side currently fragments more than
-# LP because of the keypoint-clamp asymmetry in
-# ``keypoints.py`` (HP line 203: ``d >= 0.98*arc``; LP line 249:
-# ``d <= 0.96*arc``). When somebody closes that gap the numbers below
-# will drop towards 1 and this test will fail by being TOO LENIENT —
-# update the bounds at that point.
-HP_FRAGMENTATION_BASELINE = {
-    "HP_TE_REINF": 50,  # observed ~30-100 on BAR0/IEA-22 at h=0.45-0.80
-    "HP_LE":        5,
-}
+def test_no_singleton_islands_in_chord_groups(bar0_mesh):
+    """No chord-group element should be totally isolated.
 
-
-def test_hp_side_fragmentation_within_baseline(bar0_mesh):
-    """HP-side fragmentation stays bounded by the known-bug baseline.
-
-    If this fails by going UP, something made the HP keypoints worse.
-    If it fails by going DOWN, somebody has improved keypoints and
-    should tighten or remove this snapshot.
+    A singleton means the element shares no nodes with any other
+    element of the same chord group — almost always a labelling bug.
     """
-    sizes = mc.all_group_components(bar0_mesh, min_shared_nodes=1)
-    for tag, max_components in HP_FRAGMENTATION_BASELINE.items():
-        cc = sizes.get(tag, [])
-        assert cc, f"{tag} missing from mesh"
-        assert len(cc) <= max_components, (
-            f"{tag}: fragmentation regression — got {len(cc)} components, "
-            f"baseline max is {max_components}"
+    for tag in mc.CHORD_GROUP_TAGS:
+        if tag == "SW":
+            continue
+        strays = mc.stray_elements(bar0_mesh, tag)
+        assert not strays, (
+            f"{tag}: {len(strays)} stray (totally-isolated) elements; "
+            f"first few = {strays[:5]}"
         )
 
 

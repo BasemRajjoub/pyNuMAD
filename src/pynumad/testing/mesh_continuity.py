@@ -63,9 +63,9 @@ def classify_set_name(set_name: str) -> str | None:
 def collect_groups(mesh: dict) -> dict[str, list[int]]:
     """Return ``{group_tag: [0-indexed element ids ...]}``.
 
-    Each ``elements`` row in the mesh dict is 1-indexed in the
-    element-set labels (Abaqus / ANSYS convention), so we convert to
-    0-indexed ints for downstream BFS.
+    Labels in ``mesh["sets"]["element"][...]["labels"]`` are already
+    0-indexed (the ANSYS deck writer adds ``+1`` when emitting EMODIF;
+    see ``analysis/ansys/write.py:1272``). So we pass them through as-is.
     """
     el_sets = mesh.get("sets", {}).get("element", []) or []
     groups: dict[str, list[int]] = defaultdict(list)
@@ -74,7 +74,7 @@ def collect_groups(mesh: dict) -> dict[str, list[int]]:
         if tag is None:
             continue
         for lbl in s.get("labels", []):
-            groups[tag].append(int(lbl) - 1)
+            groups[tag].append(int(lbl))
     return groups
 
 

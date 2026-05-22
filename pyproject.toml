@@ -78,6 +78,14 @@ addopts = [
   "-ra",
   "--strict-markers",
   "--strict-config",
+  # Parallel test execution via pytest-xdist:
+  #   -n auto         => one worker per logical CPU
+  #   --dist=loadfile => keep all tests from one file on one worker so
+  #                      the file-scoped mesh cache in tests/_mesh_cache.py
+  #                      stays effective (otherwise each worker rebuilds it)
+  # Override with `pytest -n 0` for serial execution / debugging.
+  "-n", "auto",
+  "--dist=loadfile",
 ]
 markers = [
   "slow: tests that take more than a few seconds (deselect with '-m \"not slow\"')",
