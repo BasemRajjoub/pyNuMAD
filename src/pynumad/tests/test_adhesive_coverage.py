@@ -263,6 +263,87 @@ def _adhesive_node_to_elements(mesh: dict) -> dict[int, list[int]]:
     return out
 
 
+def test_bondline_topology():
+    """A4: with ``includeAdhesive=True`` the mesher must emit BOTH a
+    trailing-edge AND a leading-edge bondline. The two bondlines occupy
+    disjoint chord-direction halves of the cross-section:
+
+      * TE bond  →  negative x (cluster centroid clearly < 0)
+      * LE bond  →  positive x (cluster centroid clearly > 0)
+
+    Detection is done two ways: (a) via ``mesh['adhesiveBondSets']`` if
+    present (the per-bondline element-set list emitted by the new
+    helper), and (b) by spatial split on the chord-direction centroid
+    of the adhesive node cloud. Both must agree that two well-separated
+    bondlines exist.
+    """
+    mesh = get_mesh(includeAdhesive=True, elementSize=ELEMENT_SIZE)
+    adh = np.asarray(mesh["adhesiveNds"], dtype=float)
+    els = np.asarray(mesh["adhesiveEls"], dtype=int)
+    used = _adhesive_node_use(mesh)
+    if not used.any():
+        pytest.skip("no adhesive nodes — fixture not configured for bonding")
+
+    bond_sets = mesh.get("adhesiveBondSets")
+    assert bond_sets, (
+        "mesh['adhesiveBondSets'] missing or empty — after the LE-bond "
+        "extension the mesher should expose a per-bondline element-set "
+        "list so each bondline can be identified separately downstream"
+    )
+    bond_names = {s["name"] for s in bond_sets}
+    assert "TE_BOND" in bond_names, f"TE_BOND missing from bondline sets: {bond_names}"
+    assert "LE_BOND" in bond_names, f"LE_BOND missing from bondline sets: {bond_names}"
+
+    # Each bond should have a non-trivial number of elements.
+    for s in bond_sets:
+        assert len(s["labels"]) >= 4, (
+            f"bondline {s['name']!r} has only {len(s['labels'])} elements -- "
+            f"emitter likely collapsed at the first cross-section"
+        )
+
+    # Verify the two bondlines sit on opposite chord halves. We collect
+    # nodes for each bondline by walking the element connectivity, then
+    # compute the chord-direction (x) centroid.
+    centroids: dict[str, float] = {}
+    for s in bond_sets:
+        nd_ids: set[int] = set()
+        for ei in s["labels"]:
+            for nd in els[ei]:
+                if nd >= 0:
+                    nd_ids.add(int(nd))
+        coords = adh[sorted(nd_ids)]
+        centroids[s["name"]] = float(coords[:, 0].mean())
+
+    cx_te = centroids["TE_BOND"]
+    cx_le = centroids["LE_BOND"]
+    assert cx_te < 0.0, (
+        f"TE_BOND centroid x={cx_te:.3f} expected to be negative (TE-side); "
+        f"if the helper picked the wrong corner columns the bond is on "
+        f"the wrong chord half"
+    )
+    assert cx_le > 0.0, (
+        f"LE_BOND centroid x={cx_le:.3f} expected to be positive (LE-side); "
+        f"if the helper picked the wrong corner columns the bond is on "
+        f"the wrong chord half"
+    )
+    assert cx_le - cx_te > 0.5, (
+        f"TE and LE bondline centroids too close (Δx={cx_le-cx_te:.3f}); "
+        f"the two bondlines should sit on opposite chord halves"
+    )
+
+    # Cross-check via simple chord-direction spatial split: at least
+    # 1/4 of adhesive nodes on each side of x=0.
+    pts = adh[used]
+    n_neg = int((pts[:, 0] < 0).sum())
+    n_pos = int((pts[:, 0] > 0).sum())
+    n_total = int(used.sum())
+    assert n_neg >= n_total // 4 and n_pos >= n_total // 4, (
+        f"adhesive node cloud chord-distribution skewed: n_neg={n_neg}, "
+        f"n_pos={n_pos}, n_total={n_total} -- expected both halves to "
+        f"contain at least a quarter of the nodes"
+    )
+
+
 def test_no_floating_adhesive_island():
     """A3: BFS from constrained adhesive nodes through adhesive-element
     connectivity must reach EVERY adhesive node. If any adhesive node is

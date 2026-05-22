@@ -33,6 +33,351 @@ _log = get_logger(__name__)
 _DEGENERATE_EDGE_RATIO = 0.05
 
 
+def _emit_adhesive_volume(
+    blade,
+    shellData,
+    splineXi,
+    splineYi,
+    splineZi,
+    frstXS,
+    elementSize,
+    bond_name,
+    corner_cols,
+    target_shell_set_substrs,
+):
+    """Build one swept adhesive volume + tie constraints for a single bondline.
+
+    The helper reproduces the swept-quad cross-section construction that
+    used to live inline for the TE bondline, but parameterised so the
+    same code can emit the LE bond (and, later, the shear-web-to-skin
+    bonds). It
+
+      * builds a 2D quad cross-section at ``frstXS`` from four spline
+        columns ``corner_cols = (c0, c1, c2, c3)``,
+      * sweeps that cross-section spanwise (3 spline-rows per layer) to
+        ``stPt = splineXi.shape[0]``,
+      * appends the produced nodes/elements to
+        ``shellData['adhesiveNds']`` / ``shellData['adhesiveEls']``
+        (creating the keys if absent),
+      * appends an element-set named ``bond_name`` to
+        ``shellData['adhesiveElSet']`` (also created if absent — for the
+        first bondline the value is the dict itself for backward
+        compatibility),
+      * generates LP/HP/residual tie constraints against the shell sets
+        identified by ``target_shell_set_substrs`` and appends them to
+        ``shellData['constraints']``.
+
+    Parameters
+    ----------
+    blade : Blade
+        Blade object (unused at the moment but kept in the signature so
+        future phases can read e.g. ``blade.keypoints.web_indices``).
+    shellData : dict
+        Mesh accumulator. Modified in-place.
+    splineXi, splineYi, splineZi : 2D ndarrays
+        Spline grids built by :func:`shell_mesh_general`.
+    frstXS : int
+        First spanwise spline-row where the cross-section is non-degenerate.
+    elementSize : float
+        Target element edge length.
+    bond_name : str
+        Logical bondline tag (``"TE_BOND"``, ``"LE_BOND"``, ...). Used
+        as the element-set name for *this* bondline so each bondline can
+        be identified separately by downstream code / tests.
+    corner_cols : tuple[int, int, int, int]
+        Spline-keypoint column indices for the 4 cross-section corners,
+        in the order pyNuMAD's existing TE code uses (shellKp slots
+        0, 1, 2, 3). For TE: ``(4, 6, 30, 32)``. For LE: ``(17, 15, 21, 19)``.
+        Convention: slots 0/3 are on the *outer* edge (closer to the
+        TE-tip / LE-tip), slots 1/2 are on the *inner* edge (closer to
+        the spar caps). Slots 0/1 lie on the HP-side skin, 2/3 on the
+        LP-side skin. The +y outward face is the LP face (edge 2-3),
+        the -y outward face is the HP face (edge 0-1).
+    target_shell_set_substrs : list[str | tuple[str, ...]]
+        Per-side suffix substrings identifying the shell element-sets
+        this adhesive ties to. Matched against
+        ``shellData['sets']['element'][i]['name']`` with an
+        ``endswith('_' + substr)`` test so e.g. ``'HP_LE'`` matches
+        ``05_NN_HP_LE`` but NOT ``04_NN_HP_LE_PANEL``. Each side may
+        be a single string OR a tuple of strings: the union of all
+        matching sets is used as the tie target. The first entry must
+        be the LP-side, the second the HP-side (matching the LP / HP
+        outward face convention above). For TE:
+        ``['LP_TE_REINF', 'HP_TE_REINF']``. For LE:
+        ``[('LP_LE', 'LP_LE_PANEL'), ('HP_LE', 'HP_LE_PANEL')]`` — the
+        ``_PANEL`` sets are included so adhesive nodes that extend past
+        the LE chord-segment (e.g. into the tip-taper region where the
+        bare LE stack has zero thickness) still find a target.
+    """
+    if len(corner_cols) != 4:
+        raise ValueError(
+            f"_emit_adhesive_volume({bond_name}): corner_cols must have 4 entries, got {corner_cols}"
+        )
+    if len(target_shell_set_substrs) != 2:
+        raise ValueError(
+            f"_emit_adhesive_volume({bond_name}): target_shell_set_substrs "
+            f"must have 2 entries (LP, HP), got {target_shell_set_substrs}"
+        )
+    c0, c1, c2, c3 = corner_cols
+    lp_substr, hp_substr = target_shell_set_substrs
+
+    # ------------------------------------------------------------------
+    # Determine per-edge element counts from the first cross-section.
+    # ------------------------------------------------------------------
+    stPt = frstXS
+    v1x = splineXi[stPt, c1] - splineXi[stPt, c0]
+    v1y = splineYi[stPt, c1] - splineYi[stPt, c0]
+    v1z = splineZi[stPt, c1] - splineZi[stPt, c0]
+    mag1 = np.sqrt(v1x * v1x + v1y * v1y + v1z * v1z)
+    v2x = splineXi[stPt, c2] - splineXi[stPt, c3]
+    v2y = splineYi[stPt, c2] - splineYi[stPt, c3]
+    v2z = splineZi[stPt, c2] - splineZi[stPt, c3]
+    mag2 = np.sqrt(v2x * v2x + v2y * v2y + v2z * v2z)
+    v3x = splineXi[stPt, c1] - splineXi[stPt, c2]
+    v3y = splineYi[stPt, c1] - splineYi[stPt, c2]
+    v3z = splineZi[stPt, c1] - splineZi[stPt, c2]
+    mag3 = np.sqrt(v3x * v3x + v3y * v3y + v3z * v3z)
+    v4x = splineXi[stPt, c0] - splineXi[stPt, c3]
+    v4y = splineYi[stPt, c0] - splineYi[stPt, c3]
+    v4z = splineZi[stPt, c0] - splineZi[stPt, c3]
+    mag4 = np.sqrt(v4x * v4x + v4y * v4y + v4z * v4z)
+    nE1 = np.ceil(mag1 / elementSize).astype(int)
+    nE2 = np.ceil(mag3 / elementSize).astype(int)
+    nE3 = np.ceil(mag2 / elementSize).astype(int)
+    nE4 = np.ceil(mag4 / elementSize).astype(int)
+    nEl = np.array([nE1, nE2, nE3, nE4])
+
+    # ------------------------------------------------------------------
+    # Build cross-section at frstXS and sweep along span.
+    # ------------------------------------------------------------------
+    sweepElements = []
+    guideNds = []
+    adhesMesh = None
+    while stPt < splineXi.shape[0]:
+        shellKp = np.zeros((9, 3))
+        shellKp[0, :] = np.array(
+            [splineXi[stPt, c0], splineYi[stPt, c0], splineZi[stPt, c0]]
+        )
+        shellKp[1, :] = np.array(
+            [splineXi[stPt, c1], splineYi[stPt, c1], splineZi[stPt, c1]]
+        )
+        shellKp[2, :] = np.array(
+            [splineXi[stPt, c2], splineYi[stPt, c2], splineZi[stPt, c2]]
+        )
+        shellKp[3, :] = np.array(
+            [splineXi[stPt, c3], splineYi[stPt, c3], splineZi[stPt, c3]]
+        )
+        # Midside nodes — use the +1 spline column between c0 and c1 for
+        # the HP-skin midpoint, and the +1 between c2 and c3 for the LP
+        # one. The +1 column is the next intermediate sample produced by
+        # XSCurvePts so it lies on the actual skin curve, not on a
+        # straight chord between c0 and c1. Same convention as the
+        # original TE code (which used spl5 for the HP midpoint between
+        # spl4-spl6 and spl31 for the LP midpoint between spl30-spl32).
+        c0_mid = c0 + 1
+        c3_mid = c3 - 1
+        shellKp[4, :] = np.array(
+            [splineXi[stPt, c0_mid], splineYi[stPt, c0_mid], splineZi[stPt, c0_mid]]
+        )
+        shellKp[5, :] = 0.5 * shellKp[1, :] + 0.5 * shellKp[2, :]
+        shellKp[6, :] = np.array(
+            [splineXi[stPt, c3_mid], splineYi[stPt, c3_mid], splineZi[stPt, c3_mid]]
+        )
+        shellKp[7, :] = 0.5 * shellKp[0, :] + 0.5 * shellKp[3, :]
+        shellKp[8, :] = 0.5 * shellKp[4, :] + 0.5 * shellKp[6, :]
+        sReg = ShellRegion("quad2", shellKp, nEl, elType="quad", meshMethod="free")
+        regMesh = sReg.createShellMesh()
+
+        if stPt == frstXS:
+            adhesMesh = Mesh3D(regMesh["nodes"], regMesh["elements"])
+        else:
+            guideNds.append(regMesh["nodes"])
+            layerSwEl = np.ceil(
+                (splineZi[stPt, c0] - splineZi[(stPt - 3), c0]) / elementSize
+            ).astype(int)
+            sweepElements.append(layerSwEl)
+        stPt = stPt + 3
+
+    adMeshData = adhesMesh.createSweptMesh(
+        "toDestNodes", sweepElements, destNodes=guideNds, interpMethod="smooth"
+    )
+
+    # ------------------------------------------------------------------
+    # Merge this bondline's nodes/elements into shellData. The first
+    # call just stores the arrays; subsequent calls concatenate and
+    # shift the new element connectivity by the existing node count.
+    #
+    # For backward compatibility ``shellData['adhesiveElSet']`` stays a
+    # single dict naming the combined "adhesiveElements" element-set
+    # (the Abaqus writer accesses it as a dict). Per-bondline subsets
+    # live in ``shellData['adhesiveBondSets']`` — a list of
+    # ``{name, labels}`` dicts so each physical bondline can be
+    # identified separately by downstream code / tests.
+    # ------------------------------------------------------------------
+    new_nodes = np.asarray(adMeshData["nodes"], dtype=float)
+    new_elements = np.asarray(adMeshData["elements"], dtype=int)
+    has_existing = (
+        "adhesiveNds" in shellData
+        and shellData["adhesiveNds"] is not None
+        and len(shellData["adhesiveNds"]) > 0
+    )
+    if has_existing:
+        existing_nodes = np.asarray(shellData["adhesiveNds"], dtype=float)
+        existing_elements = np.asarray(shellData["adhesiveEls"], dtype=int)
+        nd_offset = existing_nodes.shape[0]
+        el_offset = existing_elements.shape[0]
+        shifted_elements = np.where(new_elements >= 0, new_elements + nd_offset, -1)
+        merged_nodes = np.vstack([existing_nodes, new_nodes])
+        merged_elements = np.vstack([existing_elements, shifted_elements])
+        shellData["adhesiveNds"] = merged_nodes
+        shellData["adhesiveEls"] = merged_elements
+        new_el_labels = list(range(el_offset, el_offset + new_elements.shape[0]))
+        combined_n_el = merged_elements.shape[0]
+        shellData["adhesiveElSet"] = {
+            "name": "adhesiveElements",
+            "labels": list(range(0, combined_n_el)),
+        }
+        shellData.setdefault("adhesiveBondSets", [])
+        shellData["adhesiveBondSets"].append(
+            {"name": bond_name, "labels": list(new_el_labels)}
+        )
+        adMeshData_for_ties = {
+            "nodes": merged_nodes,
+            "elements": merged_elements,
+            "sets": {
+                "element": [
+                    {"name": "adhesiveElements",
+                     "labels": list(range(0, combined_n_el))},
+                    {"name": bond_name, "labels": list(new_el_labels)},
+                ],
+                "node": [],
+            },
+        }
+    else:
+        shellData["adhesiveNds"] = new_nodes
+        shellData["adhesiveEls"] = new_elements
+        adEls = new_elements.shape[0]
+        labList = list(range(0, adEls))
+        adhesSet = {"name": "adhesiveElements", "labels": labList}
+        shellData["adhesiveElSet"] = adhesSet
+        shellData["adhesiveBondSets"] = [
+            {"name": bond_name, "labels": list(labList)}
+        ]
+        adMeshData_for_ties = {
+            "nodes": new_nodes,
+            "elements": new_elements,
+            "sets": {
+                "element": [adhesSet, {"name": bond_name, "labels": list(labList)}],
+                "node": [],
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Tie constraints. Same logic as the original TE-only code but
+    # parameterised by the target shell-set substrings and the bond
+    # element set (so surface filtering on the LP/HP normals operates
+    # on *this* bondline's elements, not on every adhesive element
+    # accumulated so far). Use an endswith match so 'HP_LE' matches
+    # only ``NN_NN_HP_LE`` and not ``NN_NN_HP_LE_PANEL``.
+    # ------------------------------------------------------------------
+    # Normalise per-side substring(s) to a tuple so callers can pass a
+    # single string or a tuple covering several shell-set families.
+    lp_substrs = (lp_substr,) if isinstance(lp_substr, str) else tuple(lp_substr)
+    hp_substrs = (hp_substr,) if isinstance(hp_substr, str) else tuple(hp_substr)
+    lp_suffixes = tuple("_" + s for s in lp_substrs)
+    hp_suffixes = tuple("_" + s for s in hp_substrs)
+    lpEls = []
+    hpEls = []
+    for es in shellData["sets"]["element"]:
+        name = es["name"]
+        if any(name.endswith(sfx) for sfx in lp_suffixes):
+            lpEls.extend(es["labels"])
+        elif any(name.endswith(sfx) for sfx in hp_suffixes):
+            hpEls.extend(es["labels"])
+    lp_set_name = f"{bond_name}__LP_TGT"
+    hp_set_name = f"{bond_name}__HP_TGT"
+    all_set_name = f"{bond_name}__ALL_TGT"
+    shellData = add_element_set(shellData, {"name": lp_set_name, "labels": lpEls})
+    shellData = add_element_set(shellData, {"name": hp_set_name, "labels": hpEls})
+
+    # Classify surface nodes by their outward face normal direction.
+    # Same 60-degree-cone convention as the original TE code: edge 2-3
+    # is the LP face (outward +y), edge 0-1 the HP face (outward -y).
+    lp_nodes_setname = f"{bond_name}__LP_AdNodes"
+    hp_nodes_setname = f"{bond_name}__HP_AdNodes"
+    nDir = np.array([0.0, 1.0, 0.0])
+    adMeshData_for_ties = get_surface_nodes(
+        adMeshData_for_ties, bond_name, lp_nodes_setname, nDir, normTol=60.0
+    )
+    nDir = np.array([0.0, -1.0, 0.0])
+    adMeshData_for_ties = get_surface_nodes(
+        adMeshData_for_ties, bond_name, hp_nodes_setname, nDir, normTol=60.0
+    )
+
+    # Estimate the LP-HP gap for the fallback maxDist.
+    adhBondGap = float(mag3)
+    fallbackDist = max(1.5 * adhBondGap, 4.0 * float(elementSize))
+
+    constraints = tie_2_meshes_constraints(
+        adMeshData_for_ties, lp_nodes_setname,
+        shellData, lp_set_name,
+        0.5 * elementSize,
+    )
+    hpConst = tie_2_meshes_constraints(
+        adMeshData_for_ties, hp_nodes_setname,
+        shellData, hp_set_name,
+        0.5 * elementSize,
+    )
+    constraints.extend(hpConst)
+
+    # Combined LP+HP target set for the residual fallback.
+    shellData = add_element_set(
+        shellData,
+        {"name": all_set_name, "labels": list(set(lpEls) | set(hpEls))},
+    )
+
+    already_tied = set()
+    for ce in constraints:
+        for term in ce["terms"]:
+            if term.get("nodeSet") == "tiedMesh":
+                already_tied.add(int(term["node"]))
+
+    # Residual fallback: tie any adhesive node of *this* bondline that
+    # wasn't picked up by the LP/HP surface filter to the nearest face
+    # in the combined target set.
+    bond_elements = np.asarray(adMeshData_for_ties["elements"], dtype=int)
+    bond_label_set = set()
+    for s in adMeshData_for_ties["sets"]["element"]:
+        if s["name"] == bond_name:
+            bond_label_set = set(s["labels"])
+            break
+    used_nds = set()
+    for eid, el in enumerate(bond_elements):
+        if eid not in bond_label_set:
+            continue
+        for nd in el:
+            if nd >= 0:
+                used_nds.add(int(nd))
+    residual_labels = sorted(used_nds - already_tied)
+    if residual_labels:
+        residual_set_name = f"{bond_name}__AdNodes_residual"
+        residual_set = {"name": residual_set_name, "labels": residual_labels}
+        adMeshData_for_ties["sets"]["node"].append(residual_set)
+        resConst = tie_2_meshes_constraints(
+            adMeshData_for_ties, residual_set_name,
+            shellData, all_set_name,
+            fallbackDist,
+        )
+        constraints.extend(resConst)
+
+    if "constraints" in shellData and shellData["constraints"] is not None:
+        shellData["constraints"].extend(constraints)
+    else:
+        shellData["constraints"] = constraints
+
+    return shellData
+
+
 def _compute_edge_nels(shellKp, elementSize, region_name="", force_match_opposite=True):
     """Compute the four per-edge element counts of a shell patch from its
     corner keypoints and the target element size.
@@ -812,224 +1157,43 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
         nodeSets.append(newSet)
         shellData["sets"]["node"] = nodeSets
 
-    ## Generate mesh for trailing edge adhesive if requested
+    ## Generate adhesive bondlines if requested
     print('getting adhesive mesh')
     if includeAdhesive == 1:
-        stPt = frstXS
-        v1x = splineXi[stPt, 6] - splineXi[stPt, 4]
-        v1y = splineYi[stPt, 6] - splineYi[stPt, 4]
-        v1z = splineZi[stPt, 6] - splineZi[stPt, 4]
-        mag1 = np.sqrt(v1x * v1x + v1y * v1y + v1z * v1z)
-        v2x = splineXi[stPt, 30] - splineXi[stPt, 32]
-        v2y = splineYi[stPt, 30] - splineYi[stPt, 32]
-        v2z = splineZi[stPt, 30] - splineZi[stPt, 32]
-        mag2 = np.sqrt(v2x * v2x + v2y * v2y + v2z * v2z)
-        v3x = splineXi[stPt, 6] - splineXi[stPt, 30]
-        v3y = splineYi[stPt, 6] - splineYi[stPt, 30]
-        v3z = splineZi[stPt, 6] - splineZi[stPt, 30]
-        mag3 = np.sqrt(v3x * v3x + v3y * v3y + v3z * v3z)
-        v4x = splineXi[stPt, 4] - splineXi[stPt, 32]
-        v4y = splineYi[stPt, 4] - splineYi[stPt, 32]
-        v4z = splineZi[stPt, 4] - splineZi[stPt, 32]
-        mag4 = np.sqrt(v4x * v4x + v4y * v4y + v4z * v4z)
-        nE1 = np.ceil(mag1 / elementSize).astype(int)
-        nE2 = np.ceil(mag3 / elementSize).astype(int)
-        nE3 = np.ceil(mag2 / elementSize).astype(int)
-        nE4 = np.ceil(mag4 / elementSize).astype(int)
-        nEl = np.array([nE1, nE2, nE3, nE4])
-        gdLayer = 0
-        sweepElements = []
-        guideNds = []
-        while stPt < splineXi.shape[0]:
-            shellKp = np.zeros((9, 3))
-            shellKp[0, :] = np.array(
-                [splineXi[stPt, 4], splineYi[stPt, 4], splineZi[stPt, 4]]
-            )
-            shellKp[1, :] = np.array(
-                [splineXi[stPt, 6], splineYi[stPt, 6], splineZi[stPt, 6]]
-            )
-            shellKp[2, :] = np.array(
-                [splineXi[stPt, 30], splineYi[stPt, 30], splineZi[stPt, 30]]
-            )
-            shellKp[3, :] = np.array(
-                [splineXi[stPt, 32], splineYi[stPt, 32], splineZi[stPt, 32]]
-            )
-            shellKp[4, :] = np.array(
-                [splineXi[stPt, 5], splineYi[stPt, 5], splineZi[stPt, 5]]
-            )
-            shellKp[5, :] = 0.5 * shellKp[1, :] + 0.5 * shellKp[2, :]
-            shellKp[6, :] = np.array(
-                [splineXi[stPt, 31], splineYi[stPt, 31], splineZi[stPt, 31]]
-            )
-            shellKp[7, :] = 0.5 * shellKp[0, :] + 0.5 * shellKp[3, :]
-            shellKp[8, :] = 0.5 * shellKp[4, :] + 0.5 * shellKp[6, :]
-            sReg = ShellRegion("quad2", shellKp, nEl, elType="quad", meshMethod="free")
-            regMesh = sReg.createShellMesh()
-
-            if stPt == frstXS:
-                adhesMesh = Mesh3D(regMesh["nodes"], regMesh["elements"])
-            else:
-                guideNds.append(regMesh["nodes"])
-                layerSwEl = np.ceil(
-                    (splineZi[stPt, 4] - splineZi[(stPt - 3), 4]) / elementSize
-                ).astype(int)
-                sweepElements.append(layerSwEl)
-            stPt = stPt + 3
-
-        adMeshData = adhesMesh.createSweptMesh(
-            "toDestNodes", sweepElements, destNodes=guideNds, interpMethod="smooth"
+        # TE bondline. Corner-column convention (LP_outer-ish, HP_outer-ish,
+        # HP_inner, LP_inner) as in the original inline code: slots 0/3 sit
+        # near the TE tip, slots 1/2 sit one chord-segment inboard. The
+        # +y outward face (LP face) is between slots 2 and 3; the -y
+        # outward face (HP face) between slots 0 and 1.
+        shellData = _emit_adhesive_volume(
+            blade, shellData,
+            splineXi, splineYi, splineZi,
+            frstXS, elementSize,
+            bond_name="TE_BOND",
+            corner_cols=(4, 6, 30, 32),
+            target_shell_set_substrs=["LP_TE_REINF", "HP_TE_REINF"],
         )
-        shellData["adhesiveEls"] = adMeshData["elements"]
-        shellData["adhesiveNds"] = adMeshData["nodes"]
-        adEls = len(adMeshData["elements"])
-        adhesSet = dict()
-        adhesSet["name"] = "adhesiveElements"
-        labList = list(range(0, adEls))
-        adhesSet["labels"] = labList
-        adMeshData["sets"] = {"element": [adhesSet], "node": []}
-        shellData["adhesiveElSet"] = adhesSet
-        
-        print('getting constraints')
-        # ------------------------------------------------------------------
-        # Adhesive-to-shell tie constraints.
-        #
-        # The TE adhesive volume produced above is a swept 2D quad region
-        # spanning the trailing-edge bondline from spar-cap-LP to spar-cap-HP
-        # (chordwise) and from root to tip (spanwise). The 2D quad has four
-        # boundary edges:
-        #   * edge spl4-spl6   : LP-skin face (outward normal ~+y)
-        #   * edge spl32-spl30 : HP-skin face (outward normal ~-y)
-        #   * edge spl4-spl32  : TE-tip face (no adjacent shell -- free)
-        #   * edge spl6-spl30  : spar-cap-facing face (no adjacent shell -- free)
-        # Interior 2D quads (when nE2 > 1, which happens at small element
-        # sizes) become genuine volume-interior nodes after sweep, with no
-        # outward face at all.
-        #
-        # Historically pyNuMAD tied ONLY the LP- and HP-normal surface
-        # nodes (filtered with a 45-degree cone on the face normal) to
-        # the LP_TE_REINF / HP_TE_REINF shell sets. That leaves three
-        # categories of adhesive nodes with no constraint equation:
-        #   1. Surface nodes on the TE-tip and spar-cap-facing faces
-        #      (their normals point chordwise, not ±y).
-        #   2. Interior body nodes (no outward face at all).
-        #   3. SW/skin bond nodes -- not generated by this geometry but
-        #      historically referenced (the dead code at solidMeshFromShell
-        #      line 1103 was meant for them).
-        # Without CEs, those DOFs are coupled to the global system only
-        # through the bricks. The mesher emits the adhesive as a SEPARATE
-        # node-set (its own numbering), so ANSYS sees an island of nodes
-        # whose only stiffness link to the structure is through the few
-        # tied LP/HP surface nodes -- topologically connected (the BFS
-        # test passes), but numerically the K-matrix is near-singular and
-        # the solver aborts at fine element sizes.
-        #
-        # Fix: tie EVERY adhesive node to its nearest LP_TE_REINF or
-        # HP_TE_REINF shell-element face. For surface-LP/HP nodes the
-        # projection is short (~glue thickness) and gives the physically
-        # correct kinematic coupling; for interior nodes the projection
-        # still picks the closest skin face (either LP or HP side), which
-        # ties the brick interior to the nearer skin and lets the brick
-        # stiffness contribute to inter-skin coupling -- eliminating the
-        # singularity while leaving the global stiffness physically sound.
-        # maxDist is set to the LP-HP separation distance + a small
-        # margin so even the most-interior nodes find a target.
-        # ------------------------------------------------------------------
-        lpEls = list()
-        hpEls = list()
-        for es in shellData["sets"]["element"]:
-            if("LP_TE_REINF" in es["name"]):
-                lpEls.extend(es["labels"])
-            elif("HP_TE_REINF" in es["name"]):
-                hpEls.extend(es["labels"])
-        lpSet = {"name": "LP_TE_REINF", "labels": lpEls}
-        shellData = add_element_set(shellData,lpSet)
-        hpSet = {"name": "HP_TE_REINF", "labels": hpEls}
-        shellData = add_element_set(shellData,hpSet)
-
-        # Classify surface nodes by their outward face normal direction.
-        # Keep the legacy LP / HP classification so adhesive surface nodes
-        # closest to the LP (HP) skin are tied to LP_TE_REINF (HP_TE_REINF)
-        # rather than the wrong-side shell. Use a generous 60-degree cone
-        # so face-edge nodes whose averaged-element normal is twisted by
-        # blade pretwist still classify correctly.
-        nDir = np.array([0.0, 1.0, 0.0])
-        adMeshData = get_surface_nodes(
-            adMeshData, "adhesiveElements", "LP_AdNodes", nDir, normTol=60.0
-        )
-        nDir = np.array([0.0, -1.0, 0.0])
-        adMeshData = get_surface_nodes(
-            adMeshData, "adhesiveElements", "HP_AdNodes", nDir, normTol=60.0
+        # LE bondline. Mirror-image corner pattern about the LE column
+        # (col 18 = "le" keypoint): slots 0/3 are one fractional column
+        # off the LE on the HP/LP sides (cols 17/19); slots 1/2 are at the
+        # HP/LP "a" design keypoints (cols 15/21), one chord-segment
+        # inboard. Tie targets include both the bare LE chord-segments
+        # (NN_NN_HP_LE / NN_NN_LP_LE) and the adjacent LE_PANEL sets so
+        # tip-region LE-bond nodes (the bare LE stack tapers to zero
+        # before z=tip) still find a shell face to tie to.
+        shellData = _emit_adhesive_volume(
+            blade, shellData,
+            splineXi, splineYi, splineZi,
+            frstXS, elementSize,
+            bond_name="LE_BOND",
+            corner_cols=(17, 15, 21, 19),
+            target_shell_set_substrs=[
+                ("LP_LE", "LP_LE_PANEL"),
+                ("HP_LE", "HP_LE_PANEL"),
+            ],
         )
 
-        # Estimate the LP-HP gap so the fallback maxDist covers any
-        # interior node. mag3 (computed above) is the spline 6-to-30
-        # distance at the first cross-section. Use a generous 1.5x
-        # margin for blade pretwist / chord taper.
-        adhBondGap = float(mag3)
-        fallbackDist = max(1.5 * adhBondGap, 4.0 * float(elementSize))
 
-        # Standard LP / HP surface-to-skin ties at half-element tolerance.
-        # These give the physically-correct kinematic coupling for nodes
-        # right against the skin and produce the bulk of the CEs.
-        constraints = tie_2_meshes_constraints(
-            adMeshData, "LP_AdNodes", shellData, "LP_TE_REINF",
-            0.5 * elementSize,
-        )
-        hpConst = tie_2_meshes_constraints(
-            adMeshData, "HP_AdNodes", shellData, "HP_TE_REINF",
-            0.5 * elementSize,
-        )
-        constraints.extend(hpConst)
-
-        # Fallback: every adhesive node that wasn't tied by the
-        # near-surface passes above (TE-tip nodes, spar-cap-facing nodes,
-        # all interior body nodes) needs to be coupled to the shell
-        # somehow, otherwise ANSYS sees its DOF column with only a small
-        # block-diagonal contribution from a few bricks and the global
-        # K is numerically singular at solve time. We project each such
-        # node onto the nearest LP_TE_REINF OR HP_TE_REINF face within
-        # `fallbackDist`. The combined target set is constructed below
-        # so a node in the upper half projects to LP and a node in the
-        # lower half projects to HP automatically by nearest-face logic.
-        teSet = {
-            "name": "ALL_TE_REINF",
-            "labels": list(set(lpEls) | set(hpEls)),
-        }
-        shellData = add_element_set(shellData, teSet)
-
-        # Tied node ids already covered by the surface passes.
-        already_tied = set()
-        for ce in constraints:
-            for term in ce["terms"]:
-                if term.get("nodeSet") == "tiedMesh":
-                    already_tied.add(int(term["node"]))
-
-        # Build a node set containing every adhesive node still missing
-        # a CE. We restrict to nodes that are actually referenced by an
-        # adhesive element -- isolated geometric debris (none in practice
-        # but cheap to guard) should not be force-tied.
-        adEls = np.asarray(adMeshData["elements"], dtype=int)
-        used_nds = set()
-        for el in adEls:
-            for nd in el:
-                if nd >= 0:
-                    used_nds.add(int(nd))
-        residual_labels = sorted(used_nds - already_tied)
-        if residual_labels:
-            residual_set = {
-                "name": "AllAdNodes_residual",
-                "labels": residual_labels,
-            }
-            adMeshData["sets"]["node"].append(residual_set)
-            resConst = tie_2_meshes_constraints(
-                adMeshData, "AllAdNodes_residual",
-                shellData, "ALL_TE_REINF",
-                fallbackDist,
-            )
-            constraints.extend(resConst)
-
-        shellData["constraints"] = constraints
-        
     matList = list()
     for mn in blade.definition.materials:
         newMat = dict()
