@@ -609,36 +609,94 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
                     stPt = stPt + 1
 
     ## Shear web sections
+    #
+    # Each shear web spans HP -> LP across the cross-section.  The HP/LP
+    # endpoints are located at design keypoint indices stored in
+    # `blade.keypoints.web_indices[k_web] = [hp_key_idx, lp_key_idx]`.
+    # XSCurvePts is built with 3 fractional samples between each consecutive
+    # design keypoint, so the spline-column for design keypoint `k` is
+    # `3 * k`.
+    #
+    # Historical orientation note: in the original 2-web implementation the
+    # first web placed shellKp[0] on the HP edge and shellKp[1] on the LP
+    # edge, while the second web swapped that ordering (shellKp[0]=LP,
+    # shellKp[1]=HP).  This affects the `xyDir` of the shell section and
+    # therefore the in-plane material orientation.  To remain
+    # bit-identical for existing 2-web blades (e.g. BAR0) we preserve that
+    # convention: k_web == 0 uses HP->LP; all other webs use LP->HP.
     swES = set()
+    n_webs = swstacks.shape[0]
+    web_indices = blade.keypoints.web_indices
+
+    def _col_for_key(k_idx):
+        """Spline-column index for design keypoint `k_idx`.
+
+        XSCurvePts samples 3 fractional points between consecutive design
+        keypoints (see XSCurvePts construction above), so the column
+        offset is simply `3 * k_idx`.  Returns None when the web endpoint
+        is not snapped to a design keypoint (np.nan in web_indices).
+        """
+        if k_idx is None:
+            return None
+        try:
+            if np.isnan(k_idx):
+                return None
+        except (TypeError, ValueError):
+            pass
+        return 3 * int(k_idx)
+
     stPt = 0
-    web1Sets = np.array([])
-    web2Sets = np.array([])
     for i in range(rws - 1):
-        if swstacks[0][i].plygroups:
+        for k_web in range(n_webs):
+            sw_stack = swstacks[k_web][i]
+            if not sw_stack.plygroups:
+                continue
+
+            # Resolve HP / LP spline columns for this web.  If either
+            # endpoint isn't snapped to a design keypoint (np.nan in
+            # web_indices), we have no spline column to read from, so we
+            # skip this web at this station rather than emit garbage.
+            try:
+                hp_key, lp_key = web_indices[k_web]
+            except (IndexError, TypeError, ValueError):
+                continue
+            hp_col = _col_for_key(hp_key)
+            lp_col = _col_for_key(lp_key)
+            if hp_col is None or lp_col is None:
+                continue
+
+            # Preserve original (k_web == 0) orientation for backward
+            # compatibility; all subsequent webs use the swapped ordering
+            # historically applied to web 1.
+            if k_web == 0:
+                col0, col1 = hp_col, lp_col
+            else:
+                col0, col1 = lp_col, hp_col
+
             shellKp = np.zeros((16, 3))
             shellKp[0, :] = np.array(
-                [splineXi[stPt, 12], splineYi[stPt, 12], splineZi[stPt, 12]]
+                [splineXi[stPt, col0], splineYi[stPt, col0], splineZi[stPt, col0]]
             )
             shellKp[1, :] = np.array(
-                [splineXi[stPt, 24], splineYi[stPt, 24], splineZi[stPt, 24]]
+                [splineXi[stPt, col1], splineYi[stPt, col1], splineZi[stPt, col1]]
             )
             shellKp[2, :] = np.array(
-                [splineXi[stPt + 3, 24], splineYi[stPt + 3, 24], splineZi[stPt + 3, 24]]
+                [splineXi[stPt + 3, col1], splineYi[stPt + 3, col1], splineZi[stPt + 3, col1]]
             )
             shellKp[3, :] = np.array(
-                [splineXi[stPt + 3, 12], splineYi[stPt + 3, 12], splineZi[stPt + 3, 12]]
+                [splineXi[stPt + 3, col0], splineYi[stPt + 3, col0], splineZi[stPt + 3, col0]]
             )
             shellKp[6, :] = np.array(
-                [splineXi[stPt + 1, 24], splineYi[stPt + 1, 24], splineZi[stPt + 1, 24]]
+                [splineXi[stPt + 1, col1], splineYi[stPt + 1, col1], splineZi[stPt + 1, col1]]
             )
             shellKp[7, :] = np.array(
-                [splineXi[stPt + 2, 24], splineYi[stPt + 2, 24], splineZi[stPt + 2, 24]]
+                [splineXi[stPt + 2, col1], splineYi[stPt + 2, col1], splineZi[stPt + 2, col1]]
             )
             shellKp[10, :] = np.array(
-                [splineXi[stPt + 2, 12], splineYi[stPt + 2, 12], splineZi[stPt + 2, 12]]
+                [splineXi[stPt + 2, col0], splineYi[stPt + 2, col0], splineZi[stPt + 2, col0]]
             )
             shellKp[11, :] = np.array(
-                [splineXi[stPt + 1, 12], splineYi[stPt + 1, 12], splineZi[stPt + 1, 12]]
+                [splineXi[stPt + 1, col0], splineYi[stPt + 1, col0], splineZi[stPt + 1, col0]]
             )
             shellKp[4, :] = 0.6666 * shellKp[0, :] + 0.3333 * shellKp[1, :]
             shellKp[5, :] = 0.3333 * shellKp[0, :] + 0.6666 * shellKp[1, :]
@@ -652,89 +710,27 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
             # Per-edge element counts via the central helper, which also
             # forces opposite-edge equality to avoid the node-pulling bug.
             nEl = _compute_edge_nels(
-                shellKp, elementSize, region_name=swstacks[0][i].name
+                shellKp, elementSize, region_name=sw_stack.name
             )
             if nEl is not None:
                 bladeSurf.addShellRegion(
                     "quad3",
                     shellKp,
                     nEl,
-                    name=swstacks[0][i].name,
+                    name=sw_stack.name,
                     elType="quad",
                     meshMethod="structured",
                 )
-                swES.add(swstacks[0][i].name)
+                swES.add(sw_stack.name)
                 newSec = dict()
                 newSec["type"] = "shell"
                 layup = list()
-                for pg in swstacks[0][i].plygroups:
+                for pg in sw_stack.plygroups:
                     totThick = 0.001*pg.thickness * pg.nPlies
                     ply = [pg.materialid, totThick, pg.angle]
                     layup.append(ply)
                 newSec["layup"] = layup
-                newSec["elementSet"] = swstacks[0][i].name
-                newSec["xDir"] = np.array([0.0,0.0,1.0])
-                newSec["xyDir"] = (shellKp[1,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[3,:])
-                secList.append(newSec)
-        if swstacks[1][i].plygroups:
-            shellKp = np.zeros((16, 3))
-            shellKp[0, :] = np.array(
-                [splineXi[stPt, 27], splineYi[stPt, 27], splineZi[stPt, 27]]
-            )
-            shellKp[1, :] = np.array(
-                [splineXi[stPt, 9], splineYi[stPt, 9], splineZi[stPt, 9]]
-            )
-            shellKp[2, :] = np.array(
-                [splineXi[stPt + 3, 9], splineYi[stPt + 3, 9], splineZi[stPt + 3, 9]]
-            )
-            shellKp[3, :] = np.array(
-                [splineXi[stPt + 3, 27], splineYi[stPt + 3, 27], splineZi[stPt + 3, 27]]
-            )
-            shellKp[6, :] = np.array(
-                [splineXi[stPt + 1, 9], splineYi[stPt + 1, 9], splineZi[stPt + 1, 9]]
-            )
-            shellKp[7, :] = np.array(
-                [splineXi[stPt + 2, 9], splineYi[stPt + 2, 9], splineZi[stPt + 2, 9]]
-            )
-            shellKp[10, :] = np.array(
-                [splineXi[stPt + 2, 27], splineYi[stPt + 2, 27], splineZi[stPt + 2, 27]]
-            )
-            shellKp[11, :] = np.array(
-                [splineXi[stPt + 1, 27], splineYi[stPt + 1, 27], splineZi[stPt + 1, 27]]
-            )
-            shellKp[4, :] = 0.6666 * shellKp[0, :] + 0.3333 * shellKp[1, :]
-            shellKp[5, :] = 0.3333 * shellKp[0, :] + 0.6666 * shellKp[1, :]
-            shellKp[8, :] = 0.6666 * shellKp[2, :] + 0.3333 * shellKp[3, :]
-            shellKp[9, :] = 0.3333 * shellKp[2, :] + 0.6666 * shellKp[3, :]
-            shellKp[12, :] = 0.6666 * shellKp[11, :] + 0.3333 * shellKp[6, :]
-            shellKp[13, :] = 0.3333 * shellKp[11, :] + 0.6666 * shellKp[6, :]
-            shellKp[14, :] = 0.6666 * shellKp[7, :] + 0.3333 * shellKp[10, :]
-            shellKp[15, :] = 0.3333 * shellKp[7, :] + 0.6666 * shellKp[10, :]
-
-            # Per-edge element counts via the central helper, which also
-            # forces opposite-edge equality to avoid the node-pulling bug.
-            nEl = _compute_edge_nels(
-                shellKp, elementSize, region_name=swstacks[1][i].name
-            )
-            if nEl is not None:
-                bladeSurf.addShellRegion(
-                    "quad3",
-                    shellKp,
-                    nEl,
-                    name=swstacks[1][i].name,
-                    elType="quad",
-                    meshMethod="structured",
-                )
-                swES.add(swstacks[1][i].name)
-                newSec = dict()
-                newSec["type"] = "shell"
-                layup = list()
-                for pg in swstacks[1][i].plygroups:
-                    totThick = 0.001*pg.thickness * pg.nPlies
-                    ply = [pg.materialid, totThick, pg.angle]
-                    layup.append(ply)
-                newSec["layup"] = layup
-                newSec["elementSet"] = swstacks[1][i].name
+                newSec["elementSet"] = sw_stack.name
                 newSec["xDir"] = np.array([0.0,0.0,1.0])
                 newSec["xyDir"] = (shellKp[1,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[3,:])
                 secList.append(newSec)
@@ -894,10 +890,50 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
         shellData["adhesiveElSet"] = adhesSet
         
         print('getting constraints')
-        nDir = np.array([0.0,1.0,0.0])
-        adMeshData = get_surface_nodes(adMeshData,"adhesiveElements","LP_AdNodes",nDir,normTol=45.0)
-        nDir = np.array([0.0,-1.0,0.0])
-        adMeshData = get_surface_nodes(adMeshData,"adhesiveElements","HP_AdNodes",nDir,normTol=45.0)
+        # ------------------------------------------------------------------
+        # Adhesive-to-shell tie constraints.
+        #
+        # The TE adhesive volume produced above is a swept 2D quad region
+        # spanning the trailing-edge bondline from spar-cap-LP to spar-cap-HP
+        # (chordwise) and from root to tip (spanwise). The 2D quad has four
+        # boundary edges:
+        #   * edge spl4-spl6   : LP-skin face (outward normal ~+y)
+        #   * edge spl32-spl30 : HP-skin face (outward normal ~-y)
+        #   * edge spl4-spl32  : TE-tip face (no adjacent shell -- free)
+        #   * edge spl6-spl30  : spar-cap-facing face (no adjacent shell -- free)
+        # Interior 2D quads (when nE2 > 1, which happens at small element
+        # sizes) become genuine volume-interior nodes after sweep, with no
+        # outward face at all.
+        #
+        # Historically pyNuMAD tied ONLY the LP- and HP-normal surface
+        # nodes (filtered with a 45-degree cone on the face normal) to
+        # the LP_TE_REINF / HP_TE_REINF shell sets. That leaves three
+        # categories of adhesive nodes with no constraint equation:
+        #   1. Surface nodes on the TE-tip and spar-cap-facing faces
+        #      (their normals point chordwise, not ±y).
+        #   2. Interior body nodes (no outward face at all).
+        #   3. SW/skin bond nodes -- not generated by this geometry but
+        #      historically referenced (the dead code at solidMeshFromShell
+        #      line 1103 was meant for them).
+        # Without CEs, those DOFs are coupled to the global system only
+        # through the bricks. The mesher emits the adhesive as a SEPARATE
+        # node-set (its own numbering), so ANSYS sees an island of nodes
+        # whose only stiffness link to the structure is through the few
+        # tied LP/HP surface nodes -- topologically connected (the BFS
+        # test passes), but numerically the K-matrix is near-singular and
+        # the solver aborts at fine element sizes.
+        #
+        # Fix: tie EVERY adhesive node to its nearest LP_TE_REINF or
+        # HP_TE_REINF shell-element face. For surface-LP/HP nodes the
+        # projection is short (~glue thickness) and gives the physically
+        # correct kinematic coupling; for interior nodes the projection
+        # still picks the closest skin face (either LP or HP side), which
+        # ties the brick interior to the nearer skin and lets the brick
+        # stiffness contribute to inter-skin coupling -- eliminating the
+        # singularity while leaving the global stiffness physically sound.
+        # maxDist is set to the LP-HP separation distance + a small
+        # margin so even the most-interior nodes find a target.
+        # ------------------------------------------------------------------
         lpEls = list()
         hpEls = list()
         for es in shellData["sets"]["element"]:
@@ -909,9 +945,89 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
         shellData = add_element_set(shellData,lpSet)
         hpSet = {"name": "HP_TE_REINF", "labels": hpEls}
         shellData = add_element_set(shellData,hpSet)
-        constraints = tie_2_meshes_constraints(adMeshData,"LP_AdNodes",shellData,"LP_TE_REINF",0.5*elementSize)
-        hpConst = tie_2_meshes_constraints(adMeshData, "HP_AdNodes", shellData, "HP_TE_REINF", 0.5*elementSize)
+
+        # Classify surface nodes by their outward face normal direction.
+        # Keep the legacy LP / HP classification so adhesive surface nodes
+        # closest to the LP (HP) skin are tied to LP_TE_REINF (HP_TE_REINF)
+        # rather than the wrong-side shell. Use a generous 60-degree cone
+        # so face-edge nodes whose averaged-element normal is twisted by
+        # blade pretwist still classify correctly.
+        nDir = np.array([0.0, 1.0, 0.0])
+        adMeshData = get_surface_nodes(
+            adMeshData, "adhesiveElements", "LP_AdNodes", nDir, normTol=60.0
+        )
+        nDir = np.array([0.0, -1.0, 0.0])
+        adMeshData = get_surface_nodes(
+            adMeshData, "adhesiveElements", "HP_AdNodes", nDir, normTol=60.0
+        )
+
+        # Estimate the LP-HP gap so the fallback maxDist covers any
+        # interior node. mag3 (computed above) is the spline 6-to-30
+        # distance at the first cross-section. Use a generous 1.5x
+        # margin for blade pretwist / chord taper.
+        adhBondGap = float(mag3)
+        fallbackDist = max(1.5 * adhBondGap, 4.0 * float(elementSize))
+
+        # Standard LP / HP surface-to-skin ties at half-element tolerance.
+        # These give the physically-correct kinematic coupling for nodes
+        # right against the skin and produce the bulk of the CEs.
+        constraints = tie_2_meshes_constraints(
+            adMeshData, "LP_AdNodes", shellData, "LP_TE_REINF",
+            0.5 * elementSize,
+        )
+        hpConst = tie_2_meshes_constraints(
+            adMeshData, "HP_AdNodes", shellData, "HP_TE_REINF",
+            0.5 * elementSize,
+        )
         constraints.extend(hpConst)
+
+        # Fallback: every adhesive node that wasn't tied by the
+        # near-surface passes above (TE-tip nodes, spar-cap-facing nodes,
+        # all interior body nodes) needs to be coupled to the shell
+        # somehow, otherwise ANSYS sees its DOF column with only a small
+        # block-diagonal contribution from a few bricks and the global
+        # K is numerically singular at solve time. We project each such
+        # node onto the nearest LP_TE_REINF OR HP_TE_REINF face within
+        # `fallbackDist`. The combined target set is constructed below
+        # so a node in the upper half projects to LP and a node in the
+        # lower half projects to HP automatically by nearest-face logic.
+        teSet = {
+            "name": "ALL_TE_REINF",
+            "labels": list(set(lpEls) | set(hpEls)),
+        }
+        shellData = add_element_set(shellData, teSet)
+
+        # Tied node ids already covered by the surface passes.
+        already_tied = set()
+        for ce in constraints:
+            for term in ce["terms"]:
+                if term.get("nodeSet") == "tiedMesh":
+                    already_tied.add(int(term["node"]))
+
+        # Build a node set containing every adhesive node still missing
+        # a CE. We restrict to nodes that are actually referenced by an
+        # adhesive element -- isolated geometric debris (none in practice
+        # but cheap to guard) should not be force-tied.
+        adEls = np.asarray(adMeshData["elements"], dtype=int)
+        used_nds = set()
+        for el in adEls:
+            for nd in el:
+                if nd >= 0:
+                    used_nds.add(int(nd))
+        residual_labels = sorted(used_nds - already_tied)
+        if residual_labels:
+            residual_set = {
+                "name": "AllAdNodes_residual",
+                "labels": residual_labels,
+            }
+            adMeshData["sets"]["node"].append(residual_set)
+            resConst = tie_2_meshes_constraints(
+                adMeshData, "AllAdNodes_residual",
+                shellData, "ALL_TE_REINF",
+                fallbackDist,
+            )
+            constraints.extend(resConst)
+
         shellData["constraints"] = constraints
         
     matList = list()

@@ -14,6 +14,47 @@ from pynumad.analysis.ansys.read import readANSYSoutputs
 from pynumad.analysis.ansys.utility import txt2mat, getLoadFactorsForElementsWithSameSection,\
     getMatrialLayerInfoWithOutGUI
 
+
+# ---------------------------------------------------------------------------
+# Numeric sanitisation helpers for APDL emission.
+#
+# Several material-failure-criteria fields (g1g2, etal, etat, alp0, ...) may
+# be ``None``, ``nan`` or ``inf`` when the source YAML omits the underlying
+# inputs (e.g. ``alp0``, ``GIc``, ``GIIc``). Python's ``f"{x}"`` then prints
+# the literal tokens ``None``, ``nan``, ``-inf`` into the APDL deck, and
+# ANSYS R2023 errors out when parsing the corresponding ``tbdata`` /
+# ``mp`` / ``secdata`` commands. The helpers below coerce such non-finite
+# values to a documented numeric default and emit a one-shot warning so
+# that incomplete material definitions are observable in the run log.
+# ---------------------------------------------------------------------------
+
+_APDL_SANITISE_WARNED = set()
+
+
+def _apdl_finite(value, default, mat_name="<unknown>", field="<unknown>"):
+    """Return ``value`` if it is a finite float, otherwise ``default``.
+
+    Emits one ``warnings.warn`` per (material, field) pair so that the
+    substitution is visible without flooding the log.
+    """
+    try:
+        x = float(value)
+    except (TypeError, ValueError):
+        x = None
+    if x is None or not np.isfinite(x):
+        key = (str(mat_name), str(field))
+        if key not in _APDL_SANITISE_WARNED:
+            _APDL_SANITISE_WARNED.add(key)
+            warnings.warn(
+                f"ANSYS deck: material '{mat_name}' field '{field}' is "
+                f"{value!r}; substituting default {default!r}. This usually "
+                f"means the YAML lacks the underlying inputs (e.g. GIc/GIIc, "
+                f"alp0) — provide them to silence this warning.",
+                stacklevel=2,
+            )
+        return default
+    return x
+
 def writeAnsysDeflections(blade, config, iLoad, fid, deflectionFilename): 
     # Outer AeroShell
     nStationLayups,nStations = blade.stackdb.stacks.shape
@@ -727,6 +768,149 @@ def writeforcefile(filename, forcemap, forcesums, maptype):
     return
 
 
+def _write_ansys_adhesive(fid, blade, meshData):
+    """Emit pyNuMAD's TE/web-skin adhesive bondline as ANSYS SOLID185
+    elements + multipoint constraints.
+
+    pyNuMAD's mesh_gen produces ``adhesiveNds``, ``adhesiveEls``,
+    ``adhesiveElSet``, and ``constraints`` when called with
+    ``includeAdhesive=True``. The Abaqus writer
+    (``analysis/abaqus/write.py``) uses all four; the ANSYS writer
+    historically ignored them. This helper ports that emission so the
+    bondline (trailing-edge and shear-web-to-skin bonds) participates
+    in the FEA. Without it, TE debonding — one of the top fatigue
+    failure modes in service blades — cannot be modelled.
+
+    The shell mesh has already written nodes 1..N_shell and elements
+    1..N_shell_elem. We append adhesive nodes at IDs N_shell+1.. and
+    adhesive elements at IDs N_shell_elem+1.. so neither numbering
+    collides with the shell mesh.
+
+    Constraints tie each adhesive node (``tiedMesh``) to an
+    interpolated point on the surrounding shell mesh (``targetMesh``).
+    Each constraint record produces three ANSYS CE equations (UX, UY,
+    UZ) to enforce displacement continuity across the bondline.
+    """
+    if "adhesiveNds" not in meshData or len(meshData.get("adhesiveNds", [])) == 0:
+        return
+
+    nodes = meshData["nodes"]
+    elements = meshData["elements"]
+    n_shell_nodes = nodes.shape[0]
+    n_shell_elements = elements.shape[0]
+
+    # Look up the "Adhesive" material 1-indexed ID by matching the
+    # iteration order used earlier in write_ansys_shell_model.
+    adhesive_mat_id = None
+    for kmp, name in enumerate(blade.definition.materials):
+        if name.lower() == "adhesive":
+            adhesive_mat_id = kmp + 1
+            break
+    assert adhesive_mat_id is not None, (
+        "windIO YAML defines no 'Adhesive' material — required when "
+        "includeAdhesive=True was passed to shell_mesh_general."
+    )
+
+    # Element type ID 31 reserved for adhesive (shells use 11/12, mass 21).
+    # SOLID185 doesn't need a SECTYPE — material + element type are
+    # sufficient. SECTYPE,SOLID requires a valid subtype string and the
+    # default empty/Adhesive form is rejected by MAPDL R2023.
+    adhesive_et_id = 31
+
+    adhesive_nds = meshData["adhesiveNds"]
+    adhesive_els = meshData["adhesiveEls"]
+    constraints = meshData.get("constraints", [])
+
+    fid.write(
+        "\n! ============== ADHESIVE BONDLINE ==============\n"
+        "! Trailing-edge + shear-web-to-skin bonds. SOLID185 elements\n"
+        "! constrained to shell mesh via multipoint constraint eqns.\n"
+    )
+
+    # SOLID185 with enhanced-strain formulation (KEYOPT(2)=2).
+    # The bondline elements pyNuMAD generates can be quite skewed
+    # (interior angles up to ~170° on some bricks at the trailing
+    # edge); full integration with B-bar (KEYOPT(2)=0) gives a
+    # singular tangent matrix → "large negative pivot" solver abort.
+    # Enhanced strain adds incompatible internal modes that bend
+    # without artificially locking, robust for skewed shapes.
+    fid.write("et,%d,solid185\n" % adhesive_et_id)
+    fid.write("keyopt,%d,2,2  ! enhanced strain formulation\n"
+              % adhesive_et_id)
+    fid.write("keyopt,%d,3,0  ! homogeneous structural solid\n"
+              % adhesive_et_id)
+
+    # Adhesive nodes — IDs continue after the shell mesh.
+    fid.write("\n! Adhesive nodes (IDs %d..%d)\n"
+              % (n_shell_nodes + 1, n_shell_nodes + len(adhesive_nds)))
+    for i, nd in enumerate(adhesive_nds):
+        nid = n_shell_nodes + i + 1
+        fid.write("n,%d,%f,%f,%f\n" % (nid, nd[0], nd[1], nd[2]))
+
+    # Active attributes for the adhesive elements that follow.
+    # No SECNUM — SOLID185 doesn't require a section.
+    fid.write("\ntype,%d\nmat,%d\nesys,0\n"
+              % (adhesive_et_id, adhesive_mat_id))
+
+    # Adhesive elements. SOLID185 takes 8 nodes; a 6-node wedge is
+    # specified by collapsing the 4th->3rd and 8th->7th positions
+    # (ANSYS degenerate-brick convention). pyNuMAD's adhesiveEls
+    # array stores wedges with -1 padding in slots [6] and [7].
+    fid.write("\n! Adhesive elements (IDs %d..%d)\n"
+              % (n_shell_elements + 1, n_shell_elements + len(adhesive_els)))
+    for i, el in enumerate(adhesive_els):
+        eid = n_shell_elements + i + 1
+        # Filter -1 padding to get real node count
+        real_nodes = [n for n in el if n != -1]
+        # Convert to 1-indexed and offset into adhesive-node ID range
+        n_ids = [n_shell_nodes + n + 1 for n in real_nodes]
+        if len(n_ids) == 8:
+            fid.write("en,%d,%d,%d,%d,%d,%d,%d,%d,%d\n"
+                      % (eid, *n_ids))
+        elif len(n_ids) == 6:
+            # Wedge → collapse 4th and 8th: I,J,K,K,M,N,O,O
+            n = n_ids
+            fid.write("en,%d,%d,%d,%d,%d,%d,%d,%d,%d\n"
+                      % (eid, n[0], n[1], n[2], n[2], n[3], n[4], n[5], n[5]))
+        # else: unexpected — skip silently rather than emit garbage.
+
+    # Constraint equations: one CE per (constraint record × DOF).
+    # ANSYS CE supports up to 3 (node,DOF,coef) triples per command —
+    # use CE,NEW for the first triple set and CE,HIGH for continuation
+    # to append to the most-recently defined CE.
+    fid.write("\n! Constraint equations (UX, UY, UZ) — tie adhesive to shell\n")
+    dof_labels = ("UX", "UY", "UZ")
+    for c in constraints:
+        terms = c["terms"]
+        rhs = float(c.get("rhs", 0.0))
+        # Map each term's node into the appropriate 1-indexed ID:
+        #   tiedMesh  → adhesive node IDs (offset by n_shell_nodes)
+        #   targetMesh → shell node IDs (no offset)
+        resolved = []
+        for t in terms:
+            nid = int(t["node"]) + 1
+            if t["nodeSet"] == "tiedMesh":
+                nid += n_shell_nodes
+            resolved.append((nid, float(t["coef"])))
+
+        for dof in dof_labels:
+            # First chunk: up to 3 triples on a CE,NEW line.
+            first = resolved[:3]
+            line = "CE,NEW,%g" % rhs
+            for nid, coef in first:
+                line += ",%d,%s,%g" % (nid, dof, coef)
+            fid.write(line + "\n")
+            # Continuation chunks (3 triples each) using CE,HIGH (RHS empty).
+            for start in range(3, len(resolved), 3):
+                chunk = resolved[start:start + 3]
+                line = "CE,HIGH,"
+                for nid, coef in chunk:
+                    line += ",%d,%s,%g" % (nid, dof, coef)
+                fid.write(line + "\n")
+
+    fid.write("\nallsel\n")
+
+
 def write_ansys_shell_model(blade, meshData, config):
     """ WRITE_SHELL7 Generate the ANSYS input file that creates the blade
 
@@ -872,11 +1056,47 @@ def write_ansys_shell_model(blade, meshData, config):
             nStrenghts = uss.shape[0]
             if nStrenghts < 3:
                 uss = fullyPopluateStrengthsArray(uss)
+            # Sanitise potentially-missing strength / damage-model fields
+            # before formatting — see ``_apdl_finite`` above. Defaults:
+            #   * UTS/UCS/USS: 0.0 (no strength data ⇒ no limit; ANSYS
+            #       treats 0 as "unused" for failure-criteria tables).
+            #   * xzit/xzic/yzit/yzic (interlaminar friction coeffs): the
+            #       YAML loader already defaults these to 0.3 / 0.25, but
+            #       coerce any non-finite to those same defaults to stay
+            #       robust against custom material databases.
+            #   * g1g2  (fracture-toughness ratio GIc/GIIc): 0.5 — a
+            #       physically reasonable mid-range value for fibre-
+            #       reinforced laminates; matches the legacy regex
+            #       workaround in paper2_fem/run_static_v2.py.
+            #   * etal, etat (LaRC longitudinal/transverse friction
+            #       coefficients): 0.0 — neutral default (no friction
+            #       contribution). Computed from alp0/uss/ucs upstream;
+            #       falls back to 0.0 here when those inputs are missing.
+            #   * alp0  (LaRC fracture-plane angle, degrees): 0.0 — only
+            #       used by LaRC03/04 failure criteria; if the YAML didn't
+            #       provide it the failure model isn't active anyway.
+            uts0 = _apdl_finite(uts[0], 0.0, mat.name, 'uts[0]')
+            uts1 = _apdl_finite(uts[1], 0.0, mat.name, 'uts[1]')
+            uts2 = _apdl_finite(uts[2], 0.0, mat.name, 'uts[2]')
+            ucs0 = _apdl_finite(ucs[0], 0.0, mat.name, 'ucs[0]')
+            ucs1 = _apdl_finite(ucs[1], 0.0, mat.name, 'ucs[1]')
+            ucs2 = _apdl_finite(ucs[2], 0.0, mat.name, 'ucs[2]')
+            uss0 = _apdl_finite(uss[0], 0.0, mat.name, 'uss[0]')
+            uss1 = _apdl_finite(uss[1], 0.0, mat.name, 'uss[1]')
+            uss2 = _apdl_finite(uss[2], 0.0, mat.name, 'uss[2]')
+            xzit = _apdl_finite(getattr(mat, 'xzit', None), 0.3, mat.name, 'xzit')
+            xzic = _apdl_finite(getattr(mat, 'xzic', None), 0.25, mat.name, 'xzic')
+            yzit = _apdl_finite(getattr(mat, 'yzit', None), 0.3, mat.name, 'yzit')
+            yzic = _apdl_finite(getattr(mat, 'yzic', None), 0.25, mat.name, 'yzic')
+            g1g2 = _apdl_finite(getattr(mat, 'g1g2', None), 0.5, mat.name, 'g1g2')
+            etal = _apdl_finite(getattr(mat, 'etal', None), 0.0, mat.name, 'etal')
+            etat = _apdl_finite(getattr(mat, 'etat', None), 0.0, mat.name, 'etat')
+            alp0 = _apdl_finite(getattr(mat, 'alp0', None), 0.0, mat.name, 'alp0')
             fid.write(f'\n   tb,fcli,{kmp+1},1,20,1')
-            fid.write(f'\n   tbdata,1,{uts[0]},{ucs[0]},{uts[1]},{ucs[1]},{uts[2]},{ucs[2]}')
-            fid.write(f'\n   tbdata,7,{uss[0]},{uss[1]},{uss[2]},,,')
-            fid.write(f'\n   tbdata,13,{mat.xzit},{mat.xzic},{mat.yzit},{mat.yzic}')
-            fid.write(f'\n   tbdata,17,{mat.g1g2},{mat.etal},{mat.etat},{mat.alp0}')
+            fid.write(f'\n   tbdata,1,{uts0},{ucs0},{uts1},{ucs1},{uts2},{ucs2}')
+            fid.write(f'\n   tbdata,7,{uss0},{uss1},{uss2},,,')
+            fid.write(f'\n   tbdata,13,{xzit},{xzic},{yzit},{yzic}')
+            fid.write(f'\n   tbdata,17,{g1g2},{etal},{etat},{alp0}')
             #                     for kf = 1:numel(fcvalues)
             # fid.write('\n   tb,fcli,%d,1,20,1' % (kmp+1))
             # fid.write('\n   tbdata,1,%g,%g,%g,%g,%g,%g' % (uts[0],ucs[0],uts[1],ucs[1],uts[2],ucs[2]))
@@ -1061,7 +1281,16 @@ def write_ansys_shell_model(blade, meshData, config):
             csID = 1000 + nstat
             elementList = meshData["sets"]["element"][nelem]["labels"]
             for iEl in range(len(elementList)):
-                fid.write('   emodif,%i,secnum,%i\n' % (elementList[iEl],secID))
+                # BUGFIX: shearweb emodif must use elementList[iEl]+1 to convert
+                # the mesh-dict's 0-indexed element labels to ANSYS 1-indexed
+                # element IDs, matching the outer-shell loop above. Previously
+                # this wrote elementList[iEl] (no +1), which (a) collided the
+                # first SW element with the last outer-shell element (e.g.
+                # 10_28_LP_TE_REINF lost an EMODIF on its last element because
+                # the adjacent SW section's first emodif overwrote it) and
+                # (b) left the highest SW element ID (== n_elements) without
+                # any EMODIF assignment, so it stayed on a stale SECN.
+                fid.write('   emodif,%i,secnum,%i\n' % (elementList[iEl]+1,secID))
                 # fprintf(fid,'   emodif,#i,esys,#i\n',elementList(iEl),csID);
     
     fid.write('\n   ENSYM,,,,1,%i' % (nelements))
@@ -1097,6 +1326,9 @@ def write_ansys_shell_model(blade, meshData, config):
     fid.write('\n!   nummrg,all')
     fid.write('\n!   numcmp,node')
     fid.write('\ncsys,0\n')
+    # Adhesive emission (TE bondline + shear-web-to-skin bonds).
+    # No-op when meshData has no adhesive arrays. See helper above.
+    _write_ansys_adhesive(fid, blade, meshData)
     ### Material Properties ###
     fid.write('mpwrite,Materials,txt,,\n')
     #if ~all(cellfun('isempty',fcvalues))

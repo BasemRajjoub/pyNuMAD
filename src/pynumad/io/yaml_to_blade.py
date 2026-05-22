@@ -485,36 +485,110 @@ def _add_components(definition, blade_internal_structure, blade_structure_dict):
         raise ValueError("Invalid number of trailing edge pressure-side panels")
 
     # Web
+    #
+    # Group every shear-web layer by the YAML's ordered ``webs`` list so
+    # the downstream ``StackDatabase.swstacks`` ends up with one row per
+    # YAML-declared web (in YAML order), regardless of how many webs the
+    # blade has.  The legacy implementation collapsed all webs into two
+    # groups using substring matches on layer NAMES (``fore``/``aft`` or
+    # the digits ``0``/``1``), which silently dropped a third web for
+    # IEA-22 and was inherently fragile (e.g. a layer named
+    # ``web2_skin00`` matched ``"0"`` and landed in the wrong group).
+    #
+    # Each shear-web layer in the YAML carries a ``web:`` field whose
+    # value names one of the entries in ``webs`` (e.g. ``web0``,
+    # ``fore_web``).  We use that as the authoritative grouping signal
+    # and fall back to substring matching only when ``web:`` is missing.
 
     for comp in component_dict:
         logging.debug(comp)
-    key_list = full_keys_from_substrings(component_dict.keys(), ["web", "fore"])  # Try 1
-    if len(key_list) == 0:
-        key_list = full_keys_from_substrings(component_dict.keys(), ["web", "1"])  # Try 2
 
-    if len(key_list) > 0:
-        for key in key_list:
+    # 1) Ordered list of web names from the YAML.
+    webs_in_order = [
+        w["name"]
+        for w in blade_internal_structure.get("webs", [])
+    ]
+
+    # Per-web chord-side extent labels.  For backward compatibility with
+    # 2-web BAR-family blades the first two webs land on the spar-cap
+    # edges (``b`` and ``c``); subsequent webs cycle through the
+    # remaining design keypoints (``a`` LE-side panel and ``d`` TE-side
+    # panel).  Single key-label extents keep ``KeyPoints.web_indices``
+    # non-NaN so ``mesh_gen.shell_mesh_general`` actually emits SW
+    # element sets for every web.  Webs at non-keypoint chordwise
+    # positions (e.g. the IEA-22 ``start_nd_arc``/``end_nd_arc`` spec)
+    # are placed approximately at these design keypoints — exact
+    # placement from per-station arcs is not yet supported by the
+    # keypoint/mesh pipeline, but at least all webs are now LOADED and
+    # MESHED instead of silently dropped.
+    _DEFAULT_WEB_EXTENTS = ["b", "c", "a", "d"]
+
+    # 2) Map yaml-web-name -> group-index (1-based) preserving order.
+    name_to_group = {
+        name.lower(): (i + 1) for i, name in enumerate(webs_in_order)
+    }
+
+    # 3) Build a name-keyed lookup of layer dicts so we can read the
+    #    per-layer ``web:`` field.  ``blade_structure_dict`` already
+    #    contains every layer keyed by its lowercased name.
+    found_groups = set()
+    unassigned_keys = []
+    for comp_name, comp in component_dict.items():
+        layer = blade_structure_dict.get(comp_name.lower(), {})
+        web_field = layer.get("web") if isinstance(layer, dict) else None
+        if web_field and web_field.lower() in name_to_group:
+            grp = name_to_group[web_field.lower()]
+            web_idx = grp - 1
+            extent = _DEFAULT_WEB_EXTENTS[web_idx % len(_DEFAULT_WEB_EXTENTS)]
+            comp.hpextents = [extent]
+            comp.lpextents = [extent]
+            comp.group = grp
+            found_groups.add(grp)
+        else:
+            unassigned_keys.append(comp_name)
+
+    # 4) Legacy fallback: for layers without a usable ``web:`` field
+    #    (older YAMLs), fall back to substring matching the layer name
+    #    against ``fore``/``web1`` and ``aft``/``web0``/``rear``.  This
+    #    preserves the original two-web behaviour bit-identically.
+    if unassigned_keys:
+        # Subset of component_dict containing only unassigned layers.
+        leftover = {k: component_dict[k] for k in unassigned_keys}
+
+        fore_keys = full_keys_from_substrings(leftover.keys(), ["web", "fore"])
+        if len(fore_keys) == 0:
+            fore_keys = full_keys_from_substrings(leftover.keys(), ["web", "1"])
+        for key in fore_keys:
             component_dict[key].hpextents = ["b"]
             component_dict[key].lpextents = ["b"]
             component_dict[key].group = 1
-    elif len(key_list) == 0:
-        raise ValueError("No fore web layers found found")
+            found_groups.add(1)
 
-    key_list = full_keys_from_substrings(component_dict.keys(), ["web", "aft"])  # Try 1
-    if len(key_list) == 0:
-        key_list = full_keys_from_substrings(component_dict.keys(), ["web", "0"])  # Try 2
-    if len(key_list) == 0:
-        key_list = full_keys_from_substrings(
-            component_dict.keys(), ["web", "rear"]
-        )  # Try 3
-
-    if len(key_list) > 0:
-        for key in key_list:
+        rear_keys = full_keys_from_substrings(leftover.keys(), ["web", "aft"])
+        if len(rear_keys) == 0:
+            rear_keys = full_keys_from_substrings(leftover.keys(), ["web", "0"])
+        if len(rear_keys) == 0:
+            rear_keys = full_keys_from_substrings(leftover.keys(), ["web", "rear"])
+        for key in rear_keys:
             component_dict[key].hpextents = ["c"]
             component_dict[key].lpextents = ["c"]
             component_dict[key].group = 2
-    elif len(key_list) == 0:
-        raise ValueError("No rear web layers found found")
+            found_groups.add(2)
+
+    # 5) Sanity-check that at least one web was identified.  If the YAML
+    #    declared webs but no layer carried a ``web:`` field AND the
+    #    substring fallback also matched nothing, that is a malformed
+    #    YAML.
+    web_layers_in_dict = any(
+        ("web" in name.lower()) for name in component_dict.keys()
+    )
+    if web_layers_in_dict and not found_groups:
+        raise ValueError(
+            "No shear-web layers were grouped: YAML contains layers whose "
+            "name includes 'web' but none carries a recognised 'web:' "
+            "field and substring matching on the name found no fore/aft "
+            "pattern."
+        )
 
     ### add components to blade
     definition.components = component_dict

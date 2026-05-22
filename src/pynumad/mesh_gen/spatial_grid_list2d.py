@@ -22,8 +22,21 @@ class spatial_grid_list2d:
         return [self.xGSz*self.xRows, self.yGSz*self.yRows]
 
     def addEntry(self, val, coord):
+        # Clamp xRow/yRow to valid range. A point right on the outer
+        # boundary (coord == xMax) yields xRow == xRows, one past the
+        # last valid index, raising IndexError. Floating-point round-
+        # off can also push coords marginally outside [xMin,xMax] in
+        # fine meshes with narrow bondline regions.
         xRow = int(np.floor((coord[0] - self.xMin) / self.xGSz))
         yRow = int(np.floor((coord[1] - self.yMin) / self.yGSz))
+        if xRow < 0:
+            xRow = 0
+        elif xRow >= self.xRows:
+            xRow = self.xRows - 1
+        if yRow < 0:
+            yRow = 0
+        elif yRow >= self.yRows:
+            yRow = self.yRows - 1
         self.fullList[xRow][yRow].append(val)
 
     def findInXYMargin(self, point, Xmargin, Ymargin):

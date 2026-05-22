@@ -527,6 +527,7 @@ class Mesh2D:
                 self.edgeElements[nEi, 1] = el
                 return
         k = self.numEdges
+        self._grow_edge_arrays(k + 1)
         self.edgeNodes[k] = nds
         self.edgeElements[k, 0] = el
         edVec = self.nodes[nds[1]] - self.nodes[nds[0]]
@@ -582,6 +583,7 @@ class Mesh2D:
                             viol = self.violations(newEl)
                             if not viol:
                                 k = self.numTriEls
+                                self._grow_tri_arrays(k + 1)
                                 self.triElements[k] = newEl
                                 cent = 0.33333333 * (
                                     self.nodes[newEl[0]]
@@ -616,6 +618,7 @@ class Mesh2D:
                         viol = self.violations(newEl)
                         if not viol:
                             k = self.numTriEls
+                            self._grow_tri_arrays(k + 1)
                             self.triElements[k] = newEl
                             cent = 0.33333333 * (
                                 self.nodes[newEl[0]]
@@ -632,14 +635,62 @@ class Mesh2D:
                             return True
         return False
 
+    def _grow_node_arrays(self, target_size):
+        """Grow nodes array (and related) to at least target_size rows.
+
+        ``unstructuredPrep`` estimates ndSize empirically from the
+        boundary node count via ``4 * (nbNds/pi)**2``. For narrow,
+        elongated regions like the TE bondline this estimate
+        undershoots the actual interior node count needed for
+        triangulation, hitting IndexError at fine mesh sizes. Doubling
+        on demand is robust and only allocates extra memory when the
+        actual mesher demand exceeds the heuristic.
+        """
+        old = self.nodes.shape[0]
+        if target_size <= old:
+            return
+        new = max(2 * old, target_size)
+        grown = np.zeros((new, self.nodes.shape[1]), dtype=self.nodes.dtype)
+        grown[:old] = self.nodes
+        self.nodes = grown
+        self.ndSize = new
+
+    def _grow_tri_arrays(self, target_size):
+        old = self.triElements.shape[0]
+        if target_size <= old:
+            return
+        new = max(2 * old, target_size)
+        grown = -np.ones((new, 3), dtype=self.triElements.dtype)
+        grown[:old] = self.triElements
+        self.triElements = grown
+        self.triElSize = new
+
+    def _grow_edge_arrays(self, target_size):
+        old = self.edgeNodes.shape[0]
+        if target_size <= old:
+            return
+        new = max(2 * old, target_size)
+        grown_nds = -np.ones((new, 2), dtype=self.edgeNodes.dtype)
+        grown_nds[:old] = self.edgeNodes
+        self.edgeNodes = grown_nds
+        grown_els = -np.ones((new, 2), dtype=self.edgeElements.dtype)
+        grown_els[:old] = self.edgeElements
+        self.edgeElements = grown_els
+        grown_un = np.zeros((new, 2), dtype=self.edgeUnitNorms.dtype)
+        grown_un[:old] = self.edgeUnitNorms
+        self.edgeUnitNorms = grown_un
+        self.edSize = new
+
     def createNode(self, edgeIndex, point):
         eNds = self.edgeNodes[edgeIndex]
         n = self.numNodes
+        self._grow_node_arrays(n + 1)
         self.nodes[n] = point
         newEl = np.array([eNds[0], eNds[1], n])
         viol = self.violations(newEl)
         if not viol:
             k = self.numTriEls
+            self._grow_tri_arrays(k + 1)
             self.triElements[k] = newEl
             cent = 0.33333333 * (
                 self.nodes[newEl[0]] + self.nodes[newEl[1]] + self.nodes[newEl[2]]
