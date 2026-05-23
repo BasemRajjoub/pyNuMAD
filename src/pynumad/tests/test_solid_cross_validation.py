@@ -248,14 +248,13 @@ def _parse_ansys_solid(mac_path: str) -> dict:
                     val = int(parts[3])
                     if prop == "MAT":
                         section_assign_lines.append((val, None))
-                    elif prop == "ESYS":
-                        if section_assign_lines and section_assign_lines[-1][1] is None:
-                            matid, _ = section_assign_lines[-1]
-                            section_assign_lines[-1] = (matid, val)
-                            # Snapshot the current ESEL count as this section's size.
-                            section_member_counts.append(current_esel_count)
-                            inside_esel = False
-                            current_esel_count = 0
+                    elif prop == "ESYS" and section_assign_lines and section_assign_lines[-1][1] is None:
+                        matid, _ = section_assign_lines[-1]
+                        section_assign_lines[-1] = (matid, val)
+                        # Snapshot the current ESEL count as this section's size.
+                        section_member_counts.append(current_esel_count)
+                        inside_esel = False
+                        current_esel_count = 0
                 continue
 
     # Resolve xDir/xyDir from CSKP keypoints (origin at KP_o, xDir along
