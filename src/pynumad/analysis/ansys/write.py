@@ -1397,3 +1397,257 @@ def write_ansys_loads(nodeData, loads, forcefilename, analysisConfig):
     writeforcefile(forcefilename+'.src',forcemap,forcesums,maptype)
     print('Forces mapped to ANSYS model')
     return
+
+
+# ---------------------------------------------------------------------------
+# Full 3D solid blade writer (SOLID185 elements).
+#
+# Mirror of analysis/abaqus/write.py:write_solid_general for ANSYS APDL.
+# Consumes the same ``bladeMesh`` dict produced by ``get_solid_mesh()``:
+#   nodes (N,3), elements (M,8) with col6==-1 marking 6-node wedges,
+#   sets['element'], sections (fiber xDir/xyDir + material name per set),
+#   and optional adhesive arrays + tie constraints.
+# Materials are read from ``blade.definition.materials`` (not from the
+# mesh dict), matching the shell-model writer.
+# ---------------------------------------------------------------------------
+
+
+def _emit_solid_materials(fid, blade) -> None:
+    """Emit MP + TB,FCLI blocks for every material in ``blade.definition.materials``.
+
+    Behaviour is bit-for-bit identical to the material block in
+    ``write_ansys_shell_model`` (lines ~993-1114) — copied rather than
+    refactored to keep the shell writer untouched (minimal-diff rule).
+    Material IDs follow insertion order: kmp+1 for the kmp-th material.
+    Uses ``_apdl_finite`` to sanitise NaN/inf in failure-criteria fields.
+    """
+    fid.write('\n! WRITE MATERIAL PROPERTIES ============================\n')
+    fid.write('\n  ! FAILURE CRITERIA LIMIT TABLE LEGEND:')
+    fid.write('\n  ! tb,fcli,<mat>,ntemp,npts,tbopt')
+    fid.write('\n  !   (tbopt=1 for stress limits; default ntemp=1,npts=20)')
+    fid.write('\n  ! tbdata,1,xten,xcmp,yten,ycmp,zten,zcmp')
+    fid.write('\n  ! tbdata,7,xy,yz,xz,xycp,yzcp,xzcp')
+    fid.write('\n  ! tbdata,13,xzit,xzic,yzit,yzic')
+    fid.write('\n  ! tbdata,17,g1g2,etal,etat,alp0\n')
+    for kmp, material_name in enumerate(blade.definition.materials):
+        mat = blade.definition.materials[material_name]
+        if mat.type == 'isotropic':
+            fid.write('\n   ! %s' % (mat.name))
+            fid.write('\n   mp,ex,%d,%g' % (kmp + 1, mat.ex))
+            fid.write('\n   mp,dens,%d,%g' % (kmp + 1, mat.density))
+            fid.write('\n   mp,nuxy,%d,%g' % (kmp + 1, mat.prxy))
+        elif mat.type == 'orthotropic':
+            fid.write('\n   ! %s' % (mat.name))
+            fid.write('\n   mp,ex,%d,%g' % (kmp + 1, mat.ex))
+            fid.write('\n   mp,ey,%d,%g' % (kmp + 1, mat.ey))
+            fid.write('\n   mp,ez,%d,%g' % (kmp + 1, mat.ez))
+            fid.write('\n   mp,prxy,%d,%g' % (kmp + 1, mat.prxy))
+            fid.write('\n   mp,pryz,%d,%g' % (kmp + 1, mat.pryz))
+            fid.write('\n   mp,prxz,%d,%g' % (kmp + 1, mat.prxz))
+            fid.write('\n   mp,gxy,%d,%g' % (kmp + 1, mat.gxy))
+            fid.write('\n   mp,gyz,%d,%g' % (kmp + 1, mat.gyz))
+            fid.write('\n   mp,gxz,%d,%g' % (kmp + 1, mat.gxz))
+            fid.write('\n   mp,dens,%d,%g' % (kmp + 1, mat.density))
+        else:
+            raise ValueError(
+                "material '%s' has unknown type %r (expected 'isotropic' or 'orthotropic')"
+                % (mat.name, mat.type)
+            )
+        # Failure-criteria limit table (same defaults as shell writer)
+        try:
+            mat.uts.shape
+            uts = mat.uts
+        except AttributeError:
+            uts = np.array([mat.uts])
+        if uts.shape[0] < 3:
+            uts = fullyPopluateStrengthsArray(uts)
+        try:
+            mat.ucs.shape
+            ucs = mat.ucs
+        except AttributeError:
+            ucs = np.array([mat.ucs])
+        if ucs.shape[0] < 3:
+            ucs = fullyPopluateStrengthsArray(ucs)
+        try:
+            mat.uss.shape
+            uss = mat.uss
+        except AttributeError:
+            uss = np.array([mat.uss])
+        if uss.shape[0] < 3:
+            uss = fullyPopluateStrengthsArray(uss)
+        uts0 = _apdl_finite(uts[0], 0.0, mat.name, 'uts[0]')
+        uts1 = _apdl_finite(uts[1], 0.0, mat.name, 'uts[1]')
+        uts2 = _apdl_finite(uts[2], 0.0, mat.name, 'uts[2]')
+        ucs0 = _apdl_finite(ucs[0], 0.0, mat.name, 'ucs[0]')
+        ucs1 = _apdl_finite(ucs[1], 0.0, mat.name, 'ucs[1]')
+        ucs2 = _apdl_finite(ucs[2], 0.0, mat.name, 'ucs[2]')
+        uss0 = _apdl_finite(uss[0], 0.0, mat.name, 'uss[0]')
+        uss1 = _apdl_finite(uss[1], 0.0, mat.name, 'uss[1]')
+        uss2 = _apdl_finite(uss[2], 0.0, mat.name, 'uss[2]')
+        xzit = _apdl_finite(getattr(mat, 'xzit', None), 0.3, mat.name, 'xzit')
+        xzic = _apdl_finite(getattr(mat, 'xzic', None), 0.25, mat.name, 'xzic')
+        yzit = _apdl_finite(getattr(mat, 'yzit', None), 0.3, mat.name, 'yzit')
+        yzic = _apdl_finite(getattr(mat, 'yzic', None), 0.25, mat.name, 'yzic')
+        g1g2 = _apdl_finite(getattr(mat, 'g1g2', None), 0.5, mat.name, 'g1g2')
+        etal = _apdl_finite(getattr(mat, 'etal', None), 0.0, mat.name, 'etal')
+        etat = _apdl_finite(getattr(mat, 'etat', None), 0.0, mat.name, 'etat')
+        alp0 = _apdl_finite(getattr(mat, 'alp0', None), 0.0, mat.name, 'alp0')
+        fid.write(f'\n   tb,fcli,{kmp + 1},1,20,1')
+        fid.write(f'\n   tbdata,1,{uts0},{ucs0},{uts1},{ucs1},{uts2},{ucs2}')
+        fid.write(f'\n   tbdata,7,{uss0},{uss1},{uss2},,,')
+        fid.write(f'\n   tbdata,13,{xzit},{xzic},{yzit},{yzic}')
+        fid.write(f'\n   tbdata,17,{g1g2},{etal},{etat},{alp0}')
+        fid.write('\n')
+
+
+def _emit_solid_fiber_csys(fid, sections) -> None:
+    """Emit one CSKP-defined coordinate system per section (csys_id = 100+i).
+
+    CSKP defines a Cartesian csys from 3 keypoints: origin=KP1,
+    X-axis toward KP2, XY-plane containing KP3. KP IDs are placed at
+    99000+3*i .. 99000+3*i+2 to avoid colliding with any geometric KPs
+    that downstream APDL stages might create.
+    """
+    fid.write('\n! FIBER COORDINATE SYSTEMS (one per section) ============\n')
+    for i, sec in enumerate(sections):
+        xd = sec['xDir']
+        yd = sec['xyDir']
+        kp_o = 99000 + 3 * i
+        kp_x = kp_o + 1
+        kp_y = kp_o + 2
+        csys_id = 100 + i
+        fid.write('K,%d,0,0,0\n' % kp_o)
+        fid.write('K,%d,%g,%g,%g\n' % (kp_x, xd[0], xd[1], xd[2]))
+        fid.write('K,%d,%g,%g,%g\n' % (kp_y, yd[0], yd[1], yd[2]))
+        fid.write('CSKP,%d,0,%d,%d,%d\n' % (csys_id, kp_o, kp_x, kp_y))
+    fid.write('csys,0\n')
+
+
+def _emit_solid_section_assignments(fid, sections, el_sets, material_names) -> None:
+    """For each section, assign MAT (material index) + ESYS (CSYS 100+i)
+    to every element in its element set via ESEL,S / ESEL,A + EMODIF,ALL.
+    """
+    fid.write('\n! ASSIGN MATERIAL + ESYS PER SECTION ====================\n')
+    for i, sec in enumerate(sections):
+        # Find the element set whose name matches this section's elementSet.
+        es = next((s for s in el_sets if s['name'] == sec['elementSet']), None)
+        assert es is not None, (
+            "section %r references missing element set %r" % (i, sec['elementSet'])
+        )
+        labels = es['labels']
+        if len(labels) == 0:
+            continue
+        assert sec['material'] in material_names, (
+            "section %r references unknown material %r (known: %s)"
+            % (i, sec['material'], material_names)
+        )
+        matid = material_names.index(sec['material']) + 1
+        csys_id = 100 + i
+        fid.write('! section %d: %s (mat=%s, csys=%d)\n'
+                  % (i, sec['elementSet'], sec['material'], csys_id))
+        fid.write('ESEL,S,ELEM,,%d\n' % (labels[0] + 1))
+        for lbl in labels[1:]:
+            fid.write('ESEL,A,ELEM,,%d\n' % (lbl + 1))
+        fid.write('EMODIF,ALL,MAT,%d\n' % matid)
+        fid.write('EMODIF,ALL,ESYS,%d\n' % csys_id)
+        fid.write('allsel\n')
+
+
+def write_ansys_solid_general(fileName: str, blade, bladeMesh: dict) -> str:
+    """Write an ANSYS APDL macro for the 3D solid blade mesh.
+
+    Counterpart of ``pynumad.analysis.abaqus.write.write_solid_general``.
+    Reads node/element/section/set arrays from ``bladeMesh`` and material
+    properties from ``blade.definition.materials``. Emits SOLID185 elements
+    with KEYOPT(2)=2 (enhanced strain — robust to skewed root elements),
+    per-section fiber CSYS, root-clamped BCs, and the existing
+    ``_write_ansys_adhesive`` bondline (no-op if no adhesive arrays).
+
+    Parameters
+    ----------
+    fileName : str
+        Output path for the APDL ``.mac`` deck.
+    blade : pynumad.objects.blade.Blade
+        Source of ``definition.materials`` (dict of Material objects).
+    bladeMesh : dict
+        Output of ``pynumad.mesh_gen.get_solid_mesh``. Required keys:
+        ``nodes`` (N,3), ``elements`` (M,8; col6==-1 marks wedges),
+        ``sets['element']`` (list of {'name','labels'}), ``sections``
+        (list with 'elementSet','material','xDir','xyDir').
+        Optional: ``adhesiveNds/Els/ElSet`` + ``constraints``.
+
+    Returns
+    -------
+    str : ``fileName`` (echoed back for chainable usage).
+    """
+    nodes = bladeMesh['nodes']
+    elements = bladeMesh['elements']
+    sections = bladeMesh['sections']
+    el_sets = bladeMesh['sets']['element']
+    material_names = list(blade.definition.materials.keys())
+
+    assert nodes.shape[1] == 3, "nodes must be (N,3); got shape %r" % (nodes.shape,)
+    assert elements.shape[1] == 8, (
+        "elements must be (M,8) with col6==-1 marking wedges; got %r" % (elements.shape,)
+    )
+    assert len(sections) > 0, "bladeMesh has no sections"
+
+    with open(fileName, 'w') as fid:
+        fid.write('/nerr,500,50000\n')
+        fid.write('/prep7\n')
+
+        # --- Element type: SOLID185 with enhanced strain ---
+        fid.write('\n! DEFINE ELEMENT TYPES ==================================\n')
+        fid.write('et,11,solid185\n')
+        fid.write('keyopt,11,2,2  ! enhanced strain (robust for skewed root elements)\n')
+        fid.write('keyopt,11,3,0  ! homogeneous structural solid\n')
+
+        # --- Material properties ---
+        _emit_solid_materials(fid, blade)
+
+        # --- Per-section fiber coordinate systems ---
+        _emit_solid_fiber_csys(fid, sections)
+
+        # --- Nodes (1-indexed) ---
+        fid.write('\n! DEFINE NODES ==========================================\n')
+        for i in range(nodes.shape[0]):
+            fid.write('N,%d,%g,%g,%g\n' % (i + 1, nodes[i, 0], nodes[i, 1], nodes[i, 2]))
+
+        # --- Elements (1-indexed; degenerate SOLID185 for wedges) ---
+        fid.write('\n! DEFINE ELEMENTS =======================================\n')
+        fid.write('type,11\nmat,1\nesys,0\n')
+        for i in range(elements.shape[0]):
+            el = elements[i]
+            eid = i + 1
+            if el[6] != -1:
+                # 8-node hexahedron (canonical SOLID185)
+                fid.write('EN,%d,%d,%d,%d,%d,%d,%d,%d,%d\n' % (
+                    eid,
+                    el[0] + 1, el[1] + 1, el[2] + 1, el[3] + 1,
+                    el[4] + 1, el[5] + 1, el[6] + 1, el[7] + 1,
+                ))
+            else:
+                # 6-node wedge: degenerate brick — collapse 4th=3rd, 8th=7th
+                fid.write('EN,%d,%d,%d,%d,%d,%d,%d,%d,%d\n' % (
+                    eid,
+                    el[0] + 1, el[1] + 1, el[2] + 1, el[2] + 1,
+                    el[3] + 1, el[4] + 1, el[5] + 1, el[5] + 1,
+                ))
+
+        # --- MAT + ESYS per element set ---
+        _emit_solid_section_assignments(fid, sections, el_sets, material_names)
+
+        # --- Adhesive bondline (no-op when absent) ---
+        _write_ansys_adhesive(fid, blade, bladeMesh)
+
+        # --- Clamped root (z = 0) ---
+        fid.write('\n! CLAMPED ROOT (z=0) ====================================\n')
+        fid.write('allsel\n')
+        fid.write('nsel,s,loc,z,0\n')
+        fid.write('d,all,all\n')
+        fid.write('nsel,all\n')
+
+        # --- Finish + save database ---
+        fid.write('\nallsel\nsave\nfinish\n')
+
+    return fileName
