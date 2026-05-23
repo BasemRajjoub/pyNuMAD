@@ -46,14 +46,37 @@ class ConvergenceResult:
     def tip_umax_m(self, name: str = "tip") -> float:
         return self.tip[name]["umax_m"]
 
-    def tip_umean_m(self, name: str = "tip") -> float:
-        """Arithmetic mean of ‖u‖ over the tip band (stable convergence QoI).
+    def tip_upoint_mag_m(self, name: str = "tip") -> float | None:
+        """Magnitude of displacement at the single tip-most node.
 
-        Falls back to ``umax_m`` if the deck didn't write the mean — that
-        keeps older runs (pre-2026-05-23) loadable.
+        Mesh-independent in the limit (every refinement still has one
+        node at z = z_max). Returns ``None`` if the older deck didn't
+        write this row.
         """
-        if "umean_m" in self.tip.get(name, {}):
-            return self.tip[name]["umean_m"]
+        return self.tip.get(name, {}).get("upoint_mag_m")
+
+    def tip_umean_m(self, name: str = "tip") -> float:
+        """Magnitude of the mean displacement vector over the tip band.
+
+        Computed as ``sqrt(<UX>² + <UY>² + <UZ>²)`` where each ``<U·>``
+        is the per-element ETABLE+SSUM mean over the tip band. This is
+        the canonical stable tip-deflection QoI for cantilever-blade
+        FE convergence; it's signed by virtue of being a magnitude of a
+        mean vector (mean cancellations show as smaller values, but
+        won't flip sign).
+
+        Backward compatibility:
+        * Older runs (pre-2026-05-23) wrote a single ``umean_m`` row;
+          we return that directly when present.
+        * Even older runs wrote only ``umax_m`` — we return that as a
+          last-resort fallback.
+        """
+        t = self.tip.get(name, {})
+        if "umean_m" in t:
+            return t["umean_m"]
+        if all(k in t for k in ("umean_x_m", "umean_y_m", "umean_z_m")):
+            import math
+            return math.sqrt(t["umean_x_m"]**2 + t["umean_y_m"]**2 + t["umean_z_m"]**2)
         return self.tip_umax_m(name)
 
 

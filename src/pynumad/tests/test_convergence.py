@@ -90,20 +90,46 @@ class TestApdlEmit:
         assert "*CFOPEN,qoi.csv" in s
         assert "category,name,key,value" in s
 
-    def test_emit_tip_deflection_writes_three_rows(self):
+    def test_emit_tip_deflection_writes_all_rows(self):
         spec = TipDeflectionSpec(name="tip", z_band_m=(135.0, 140.0))
         s = emit_tip_deflection(spec)
+        # Node-side selection for umax_m via NSORT
         assert "NSEL,S,LOC,Z,135.000000,140.000000" in s
         assert "NSORT,U,SUM" in s
-        # max, mean, count
-        assert s.count("*VWRITE") == 3
-        # Names baked into format-string literals.
-        assert "('tip,tip,umax_m,'" in s
-        assert "('tip,tip,umean_m,'" in s
-        assert "('tip,tip,n_nodes,'" in s
-        # Mean via *VGET + *VSCFUN
-        assert "*VGET,_tip_u(1),NODE,,U,SUM" in s
-        assert "*VSCFUN,_tip_umean,MEAN" in s
+        # Element-side selection (CENT,Z) for per-component means.
+        assert "ESEL,S,CENT,Z,135.000000,140.000000" in s
+        assert "ETABLE,ux_,U,X" in s
+        assert "ETABLE,uy_,U,Y" in s
+        assert "ETABLE,uz_,U,Z" in s
+        # Single tip-most-node QoI
+        assert "*GET,z_max_,NODE,0,MXLOC,Z" in s
+        # 11 *VWRITE rows: umax, umean_x/y/z, n_elements, n_nodes,
+        # upoint_x/y/z, upoint_mag, upoint_z_loc
+        assert s.count("*VWRITE") == 11
+        for key in ("umax_m", "umean_x_m", "umean_y_m", "umean_z_m",
+                    "n_elements", "n_nodes",
+                    "upoint_x_m", "upoint_y_m", "upoint_z_m",
+                    "upoint_mag_m", "upoint_z_loc_m"):
+            assert f"('tip,tip,{key},'" in s
+
+
+    def test_tip_umean_m_computes_magnitude_from_components(self):
+        from pynumad.analysis.convergence import ConvergenceResult
+        r = ConvergenceResult()
+        r.tip["tip"] = {
+            "umax_m": 17.6,
+            "umean_x_m": 3.0,
+            "umean_y_m": 4.0,
+            "umean_z_m": 0.0,
+        }
+        # |(3, 4, 0)| = 5
+        assert r.tip_umean_m() == pytest.approx(5.0)
+
+    def test_tip_umean_m_falls_back_to_umax_for_older_runs(self):
+        from pynumad.analysis.convergence import ConvergenceResult
+        r = ConvergenceResult()
+        r.tip["tip"] = {"umax_m": 17.6}
+        assert r.tip_umean_m() == 17.6
 
     def test_emit_patch_uses_element_id_ranges(self):
         spec = PatchSpec(

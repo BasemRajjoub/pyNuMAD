@@ -94,17 +94,67 @@ NSEL,S,LOC,Z,{z_lo:.6f},{z_hi:.6f}
 *IF,n_tip_nd,GT,0,THEN
   NSORT,U,SUM,1,0,0
   *GET,tip_umax,SORT,,MAX
-  ! Mean ‖u‖ over the tip band via *VGET into an array, then *VSCFUN MEAN.
-  *DIM,_tip_u,ARRAY,n_tip_nd
-  *VGET,_tip_u(1),NODE,,U,SUM
-  *VSCFUN,_tip_umean,MEAN,_tip_u(1)
+*ENDIF
+! Component-wise mean displacements via ETABLE+SSUM on tip-band
+! elements (CENT,Z selection).  ETABLE,U,SUM (the "vector magnitude"
+! item) returns NEGATIVE values on this mesh — likely algebraic sum
+! of components rather than magnitude as the docs claim.  Per-component
+! ETABLE,U,X/Y/Z is reliable, well-documented and gives signed mean
+! displacements per axis.  Magnitude is then computed in Python from
+! the three component means by parse-side post-processing.
+ALLSEL
+ESEL,S,CENT,Z,{z_lo:.6f},{z_hi:.6f}
+*GET,n_tip_el,ELEM,0,COUNT
+*IF,n_tip_el,GT,0,THEN
+  ETABLE,erase
+  ETABLE,ux_,U,X
+  ETABLE,uy_,U,Y
+  ETABLE,uz_,U,Z
+  SSUM
+  *GET,sum_ux_,SSUM,0,ITEM,UX_
+  *GET,sum_uy_,SSUM,0,ITEM,UY_
+  *GET,sum_uz_,SSUM,0,ITEM,UZ_
+  _tip_umx = sum_ux_ / n_tip_el
+  _tip_umy = sum_uy_ / n_tip_el
+  _tip_umz = sum_uz_ / n_tip_el
   *VWRITE,tip_umax
 ('tip,{spec.name},umax_m,',E16.8)
-  *VWRITE,_tip_umean
-('tip,{spec.name},umean_m,',E16.8)
+  *VWRITE,_tip_umx
+('tip,{spec.name},umean_x_m,',E16.8)
+  *VWRITE,_tip_umy
+('tip,{spec.name},umean_y_m,',E16.8)
+  *VWRITE,_tip_umz
+('tip,{spec.name},umean_z_m,',E16.8)
+  *VWRITE,n_tip_el
+('tip,{spec.name},n_elements,',F12.0)
   *VWRITE,n_tip_nd
 ('tip,{spec.name},n_nodes,',F12.0)
-  *DEL,_tip_u
+*ENDIF
+! Single-node tip-most QoI for mesh-independence comparison. Pick the
+! node with the maximum z coordinate in the model and report its U
+! components.  This is the conventional "tip-LE deflection" used by
+! IEC 61400-1 acceptance tests — mesh-independent in the limit because
+! every refinement still has a single tip-most node at z = max(z).
+ALLSEL
+*GET,z_max_,NODE,0,MXLOC,Z
+NSEL,S,LOC,Z,z_max_ - 0.001,z_max_ + 0.001
+*GET,n_at_max_,NODE,0,COUNT
+*IF,n_at_max_,GT,0,THEN
+  *GET,tip_node_,NODE,0,NUM,MIN
+  *GET,tip_ux_,NODE,tip_node_,U,X
+  *GET,tip_uy_,NODE,tip_node_,U,Y
+  *GET,tip_uz_,NODE,tip_node_,U,Z
+  tip_umagnode_ = sqrt(tip_ux_*tip_ux_+tip_uy_*tip_uy_+tip_uz_*tip_uz_)
+  *VWRITE,tip_ux_
+('tip,{spec.name},upoint_x_m,',E16.8)
+  *VWRITE,tip_uy_
+('tip,{spec.name},upoint_y_m,',E16.8)
+  *VWRITE,tip_uz_
+('tip,{spec.name},upoint_z_m,',E16.8)
+  *VWRITE,tip_umagnode_
+('tip,{spec.name},upoint_mag_m,',E16.8)
+  *VWRITE,z_max_
+('tip,{spec.name},upoint_z_loc_m,',E16.8)
 *ENDIF
 ALLSEL
 """
