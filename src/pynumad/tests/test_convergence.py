@@ -90,16 +90,22 @@ class TestApdlEmit:
         assert "*CFOPEN,qoi.csv" in s
         assert "category,name,key,value" in s
 
-    def test_emit_tip_deflection_writes_one_row(self):
+    def test_emit_tip_deflection_writes_three_rows(self):
         spec = TipDeflectionSpec(name="tip", z_band_m=(135.0, 140.0))
         s = emit_tip_deflection(spec)
         assert "NSEL,S,LOC,Z,135.000000,140.000000" in s
         assert "NSORT,U,SUM" in s
-        # Single *VWRITE for the umax row
-        assert s.count("*VWRITE") == 1
-        assert "'tip,'" in s and "umax_m" in s
+        # max, mean, count
+        assert s.count("*VWRITE") == 3
+        # Names baked into format-string literals.
+        assert "('tip,tip,umax_m,'" in s
+        assert "('tip,tip,umean_m,'" in s
+        assert "('tip,tip,n_nodes,'" in s
+        # Mean via *VGET + *VSCFUN
+        assert "*VGET,_tip_u(1),NODE,,U,SUM" in s
+        assert "*VSCFUN,_tip_umean,MEAN" in s
 
-    def test_emit_patch_includes_all_matching_components(self):
+    def test_emit_patch_uses_element_id_ranges(self):
         spec = PatchSpec(
             name="HP_SPAR_r20",
             element_set_substr="HP_SPAR",
@@ -107,46 +113,75 @@ class TestApdlEmit:
             layers=(3,),
             surfaces=("TOP", "BOT"),
         )
-        matching = ["03_05_HP_SPAR", "03_06_HP_SPAR", "03_07_HP_SPAR"]
-        s = emit_patch(spec, matching)
-        for c in matching:
-            assert f"CMSEL,A,{c}" in s
+        ranges = [(100, 119), (200, 219), (300, 319)]
+        s = emit_patch(spec, ranges)
+        for lo, hi in ranges:
+            assert f"ESEL,A,ELEM,,{lo},{hi}" in s
         # z-band restriction
         assert "ESEL,R,CENT,Z,18.000000,22.000000" in s
         # Both surfaces emitted
         assert "LAYER,3" in s
         assert "SHELL,TOP" in s
         assert "SHELL,BOT" in s
-        # Area-weighted formula: σ·V summed then divided by V summed
+        # Area-weighted formula: σ·V summed then divided by V summed.
+        # ETABLE math in APDL uses SMULT (not ETABLE,*,...).
         assert "ETABLE,vol_,VOLU" in s
         assert "ETABLE,svm_,S,EQV" in s
-        assert "ETABLE,svw_,*,svm_,vol_" in s
+        assert "SMULT,svw_,svm_,vol_,1,1" in s
         assert "sum_sw_ / sum_v_" in s
 
-    def test_emit_patch_with_no_matching_components_emits_warning_only(self):
+    def test_emit_patch_with_no_ranges_emits_warning_only(self):
         spec = PatchSpec(name="empty", element_set_substr="ZZ", z_band_m=(0, 10))
         s = emit_patch(spec, [])
         assert "WARNING" in s
-        assert "CMSEL" not in s
+        assert "ESEL,A,ELEM" not in s
+
+    def test_patch_element_ranges_from_mesh_uses_one_indexed_labels(self):
+        from pynumad.analysis.convergence import patch_element_ranges_from_mesh
+        # pyNuMAD mesh-dict labels are 0-indexed; we should add 1 to
+        # the min and max so the returned range is ANSYS 1-indexed.
+        mesh = {"sets": {"element": [
+            {"name": "03_05_HP_SPAR", "labels": [99, 100, 101]},  # 0-idx
+            {"name": "03_06_HP_SPAR", "labels": [200, 201]},
+            {"name": "10_05_LP_SPAR", "labels": [500, 501]},     # not matching
+        ]}}
+        ranges = patch_element_ranges_from_mesh(mesh, "HP_SPAR")
+        assert ranges == [(100, 102), (201, 202)]
+
+    def test_patch_element_ranges_skips_empty_sets(self):
+        from pynumad.analysis.convergence import patch_element_ranges_from_mesh
+        mesh = {"sets": {"element": [
+            {"name": "00_00_HP_SPAR", "labels": []},
+            {"name": "00_01_HP_SPAR", "labels": [5, 6, 7]},
+        ]}}
+        ranges = patch_element_ranges_from_mesh(mesh, "HP_SPAR")
+        assert ranges == [(6, 8)]
 
     def test_emit_section_writes_six_resultant_rows(self):
         spec = SectionSpec(name="section_r20", z_m=20.0)
         s = emit_section(spec)
         assert "ESEL,S,CENT,Z,20.000000,1.0e10" in s
         assert "WPOFFS,0,0,20.000000" in s
-        # 6 *VWRITE rows: Fx, Fy, Fz, Mx, My, Mz
+        # 6 *VWRITE rows: Fx, Fy, Fz, Mx, My, Mz — name + key baked into
+        # the format-string literal (APDL 8-char string-data limit).
         for key in ("Fx_N", "Fy_N", "Fz_N", "Mx_Nm", "My_Nm", "Mz_Nm"):
-            assert f"'{key}'" in s
+            assert f"('section,section_r20,{key},'" in s
         assert s.count("*VWRITE") == 6
 
     def test_emit_post1_full_round_trip(self):
         spec = iea22_default_spec()
-        # Manufacture set names matching every patch's substring.
-        set_names = []
+        # Manufacture a mesh dict matching every patch's substring with
+        # 3 stations × 4 elements each (arbitrary, just non-empty).
+        sets = []
+        elem_id = 0
         for patch in spec.patches:
             for k in range(3):
-                set_names.append(f"00_{k:02d}_{patch.element_set_substr}")
-        s = emit_post1(spec, set_names)
+                labels = list(range(elem_id, elem_id + 4))
+                sets.append({"name": f"00_{k:02d}_{patch.element_set_substr}",
+                             "labels": labels})
+                elem_id += 4
+        mesh = {"sets": {"element": sets}}
+        s = emit_post1(spec, mesh)
         # Sanity: opens + closes CSV exactly once
         assert s.count("*CFOPEN") == 1
         assert s.count("*CFCLOSE") == 1
@@ -155,6 +190,9 @@ class TestApdlEmit:
             assert f"patch block: {patch.name}" in s
         for sec in spec.sections:
             assert f"section cut block: {sec.name}" in s
+        # Patches should emit ESEL,A,ELEM ranges, not CMSEL,A,<name>
+        assert "ESEL,A,ELEM" in s
+        assert "CMSEL,A" not in s
 
 
 # ---------------------------------------------------------------------------

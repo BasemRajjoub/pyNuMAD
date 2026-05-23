@@ -53,6 +53,12 @@ from pynumad.analysis.convergence.apdl import (
     emit_section,
     emit_tip_deflection,
     filter_element_sets,
+    patch_element_ranges_from_mesh,
+)
+from pynumad.analysis.convergence.forces_src import (
+    read_forces_src,
+    section_resultants,
+    section_resultants_at,
 )
 from pynumad.analysis.convergence.parse import (
     ConvergenceResult,
@@ -81,9 +87,14 @@ __all__ = [
     "emit_section",
     "emit_post1",
     "filter_element_sets",
+    "patch_element_ranges_from_mesh",
     # parse
     "ConvergenceResult",
     "parse_results",
+    # forces_src
+    "read_forces_src",
+    "section_resultants",
+    "section_resultants_at",
     # analyze
     "DriftRow",
     "analyse",

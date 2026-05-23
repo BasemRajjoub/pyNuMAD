@@ -46,6 +46,16 @@ class ConvergenceResult:
     def tip_umax_m(self, name: str = "tip") -> float:
         return self.tip[name]["umax_m"]
 
+    def tip_umean_m(self, name: str = "tip") -> float:
+        """Arithmetic mean of ‖u‖ over the tip band (stable convergence QoI).
+
+        Falls back to ``umax_m`` if the deck didn't write the mean — that
+        keeps older runs (pre-2026-05-23) loadable.
+        """
+        if "umean_m" in self.tip.get(name, {}):
+            return self.tip[name]["umean_m"]
+        return self.tip_umax_m(name)
+
 
 def parse_results(csv_path: str | Path) -> ConvergenceResult:
     """Read the four-column CSV emitted by :func:`emit_post1`."""
