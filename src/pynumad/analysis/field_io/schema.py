@@ -96,6 +96,24 @@ STRAIN_COMPONENTS: tuple[str, ...] = (
 SURFACES: tuple[str, ...] = ("TOP", "MID", "BOT")
 N_SURF = 3
 
+# SHELL181 is a Mindlin-Reissner shell with a plane-stress kinematic
+# assumption (sigma_33 ~ 0 by element formulation; eps_13, eps_23 not
+# solved). The transverse-shear stresses (s13, s23) are RECONSTRUCTED
+# post-solve from a parabolic equilibrium ansatz, not from the
+# constitutive equation - they are not honest FE outputs and should
+# not feed a PCE / Sobol analysis. For SHELL281 quadratic shells or
+# solid elements these would become meaningful and the skip-list
+# below should be re-evaluated.
+#
+# The KL/PCE loader (paper2_fem/03_post_klpce/load_snapshots.py)
+# consumes this constant and excludes the listed (field, components)
+# from snapshot stacking by default.
+SHELL181_INVALID: dict[str, tuple[str, ...]] = {
+    "stress": ("s33", "s13", "s23"),
+    "strain": ("gamma13", "gamma23"),
+    # eps33 is never extracted - no entry needed.
+}
+
 REQUIRED_META_ATTRS: tuple[str, ...] = (
     "sample_id",
     "doe_seed",

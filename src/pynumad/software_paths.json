@@ -1,5 +1,6 @@
-{"pynumad" : "",
-"ansys" : "",
-"cubit" : "",
-"cubit_enhancements" : ""
+{
+    "pynumad": "",
+    "ansys": "/sw/apps/software/noarch/ANSYS/2023.2/v232/ansys/bin/ansys232",
+    "cubit": "",
+    "cubit_enhancements": ""
 }
