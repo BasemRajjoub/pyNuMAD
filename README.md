@@ -1,33 +1,23 @@
- # pyNuMAD
-[pyNuMAD (Python Numerical Manufacturing And Design)](https://github.com/sandialabs/pyNuMAD) is an object-oriented, open-source software program written in Python which simplifies the process of creating a three-dimensional model of a wind turbine blade. The tool organizes all blade information including aerodynamic and material properties as well as material placement into an
-intuitive API for use with other softwares. The purpose of pyNuMAD is to provide an intermediary between raw blade data in the form of yaml, excel, xml files and analytical platforms
-(ANSYS, Cubit, openFAST, etc).
+# pyNuMAD — `pce-patches` fork
 
-For any questions or support [create a new issue](https://github.com/sandialabs/pyNuMAD/issues/new) on GitHub.
+Fork of Sandia's
+[pyNuMAD](https://github.com/sandialabs/pyNuMAD) (BSD-3) extended with
+a **full 3D solid composite blade pipeline** for ANSYS:
 
+- New writer `write_ansys_solid_general` — APDL counterpart of the
+  existing Abaqus `write_solid_general` (SOLID185, per-section fiber
+  CSYS, adhesive bondline).
+- Three-stage industry-standard mesh-quality treatment in
+  `solidMeshFromShell` (normal smoothing + adaptive layer-thickness
+  clamp + Knupp-style untangling) — drives BAR0 bad-Jacobian count
+  from 94 → 0.
+- End-to-end validation: 54 unit/cross-val tests + 1 ANSYS R2023
+  integration test pass.
 
-## Part of the WETO Stack
+See [`docs/dev/TODO_solid_3d_pipeline.md`](docs/dev/TODO_solid_3d_pipeline.md)
+for the full pickup-anywhere reference, and
+[`CHANGELOG.md`](CHANGELOG.md) for the fork-specific commit log.
 
-pyNuMAD is primarily developed with the support of the U.S. Department of Energy and is part of the [WETO Software Stack](https://nrel.github.io/WETOStack). For more information and other integrated modeling software, see:
-- [Portfolio Overview](https://nrel.github.io/WETOStack/portfolio_analysis/overview.html)
-- [Entry Guide](https://nrel.github.io/WETOStack/_static/entry_guide/index.html)
-
-## Documentation
-Documentation for pynumad is accessible at https://sandialabs.github.io/pyNuMAD/.
-
-![](docs/_static/images/pyNuMAD_overview.png)
-
-## Examples
-
-Step-by-step examples are located in the [examples](https://github.com/sandialabs/pyNuMAD/tree/main/examples) folder. Follow allong in the documentation.
-
-## License
-
-pyNuMAD is licensed under BSD 3-clause license. Please see the
-[LICENSE](https://github.com/sandialabs/pyNuMAD/blob/main/LICENSE) included in
-the source code repository for more details.
-
-## Acknowledgements 
-
-pyNuMAD is currently being developed with funding from Department of Energy's
-(DOE) Energy Efficiency and Renewable Energy (EERE) Wind Energy Technology Office (WETO). 
+For everything else (background, original documentation, examples,
+license terms), see upstream:
+https://github.com/sandialabs/pyNuMAD
