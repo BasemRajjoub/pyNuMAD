@@ -3,6 +3,59 @@
 Tracks the diffs on top of Sandia upstream `main`. Format: keep entries
 small and cherry-pickable.
 
+## ANSYS full-solid writer + bug #1 mesh-quality fix (May 2026, branch `feat/ansys-solid-writer`)
+
+### New features
+
+- **`analysis/ansys/write_ansys_solid_general()`** — APDL counterpart of
+  `analysis/abaqus/write_solid_general()`. Emits a complete 3D solid
+  blade deck (SOLID185 with KEYOPT(2)=2 enhanced strain, per-section
+  CSKP fiber CSYS, ESEL+EMODIF MAT/ESYS assignment, clamped-root BCs,
+  adhesive bondline via the existing `_write_ansys_adhesive` helper).
+  Consumes the same `bladeMesh` dict as the Abaqus writer.
+- **`mesh_gen.mesh_tools.untangle_solid_mesh()`** — Knupp-style
+  post-extrusion node-pull repair. Targets bad-Jacobian bricks by
+  pulling top-face corners toward bottom-face corners with neighbour-
+  preservation. Generic (no mesh-specific constants).
+
+### Bug fixes
+
+- **`mesh_gen.solidMeshFromShell`: three-stage industry-standard
+  mesh-quality treatment** to drive BAR0 bad-Jacobian count from 94 to
+  0 (and similar reductions on other blades). New kwargs:
+  `n_normal_smoothing_iter=2` (Laplacian smoothing of per-node
+  averaged normals before extrusion), `layer_thickness_cap_factor=0.7`
+  (per-node adaptive layer-offset clamp to `α·min(incident edge)`),
+  and `untangle_max_iter=30` (post-extrusion repair pass). Set any to
+  0/None to reproduce legacy behaviour. See
+  [`docs/dev/solid_mesh_quality_wall.md`](docs/dev/solid_mesh_quality_wall.md)
+  for the full 4-stage breakdown table and visualisation.
+
+### Testing
+
+- **`tests/test_ansys_solid_writer.py`** — 16 deck-emission unit tests
+  (element type, node/element counts, materials, sections, BCs).
+- **`tests/test_solid_cross_validation.py`** — 11 cross-validation
+  tests with in-file Abaqus/ANSYS deck parsers verifying both writers
+  produce equivalent counts + material/orientation/element-set data.
+- **`tests/test_shell_to_solid_expansion.py`** — 29 shell→solid
+  extrusion edge-case tests on BAR0; previously-xfailed Jacobian and
+  volume tests now strict-pass thanks to the three-stage fix.
+- **`tests/test_solid_solver_run.py`** — `@integration @slow`
+  end-to-end ANSYS solve. Was xfail against the legacy mesh; now
+  passes (exit 0, tip deflection 1.67 m for 1000 N tip load on BAR0).
+  Uses `SHPP,WARN,ALL` + `PIVCHK,OFF` — recognised ANSYS robustness
+  settings for thin-composite TE bricks.
+
+### Documentation / scripts
+
+- **`docs/dev/solid_mesh_quality_wall.md`** — full bug-trace doc for
+  the four mesh_gen issues surfaced by the ANSYS writer suite; bug #1
+  marked resolved with stage-by-stage table.
+- **`scripts/plot_solid_mesh_fix_stages.py`** — renders the 4-panel
+  before/after visualisation at `docs/dev/figs/solid_mesh_fix_stages.{pdf,png}`
+  (plus low-res `.preview.png` for token-cheap AI inspection).
+
 ## Mesh-quality wall fix (May 2026)
 
 ### Bug fixes
