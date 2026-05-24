@@ -36,48 +36,56 @@ trailing-edge flat) region between span z=22.4 m and z=44.6 m, layers
 `*** ERROR *** Brick element N has a zero or negative determinant
 of the Jacobian matrix at one of its sampling locations`.
 
-**Partial fix landed:**
-`solidMeshFromShell` now runs a Laplacian smoothing pass over the
-per-node averaged normals before extrusion (kwarg
-`n_normal_smoothing_iter=2` by default; set to 0 to reproduce legacy
-behavior). The smoothing averages each node's normal with its
-ring-1 neighbours over 2 iterations, which reduces sharp divergence
-at the TE without significantly tilting layers in the bulk.
+**Partial fix landed — industry-standard two-pass treatment:**
+`solidMeshFromShell` now applies the two mesh-quality treatments
+standard in industrial boundary-layer / sweep meshers (HyperMesh
+"Bias Style", ANSYS Workbench Sweep, Cubit Sweep, Pointwise T-Rex):
 
-| state | bad elements | rate |
-|---|---|---|
-| legacy (k=0) | 94 / 16653 | 0.564 % |
-| k=2 (new default) | **28 / 16653** | **0.168 %** |
-| k=5 | 21 / 16653 | 0.126 % |
-| k=10+ | 25-30 (asymptote) | ≥0.13 % |
+1. **Laplacian smoothing of per-node averaged normals before
+   extrusion** (kwarg `n_normal_smoothing_iter=2` by default; set to 0
+   to disable). Reduces sharp normal divergence at TE / root taper.
+2. **Per-node adaptive layer-thickness clamping** (kwarg
+   `layer_thickness_cap_factor=0.7` by default; set to `None` to
+   disable). At each node, cap the layer offset to
+   `α · min(incident shell-edge length)`. Prevents knife-edge bricks
+   where the shell quad is locally thin. Trade-off: at constrained
+   nodes the layer is locally thinner than the nominal ply, slightly
+   under-representing through-thickness stiffness.
 
-Smoothing alone asymptotes near 20 bad elements — beyond k=5 returns
-diminish and even worsen. The remaining elements have extreme
-in-plane aspect ratios (~16:1, e.g. element 7112: 0.49 m × 0.03 m)
-where the through-thickness brick is essentially a knife edge that
-flips for any small normal misalignment.
+| state | bad elements | rate | reduction |
+|---|---|---|---|
+| legacy (no smoothing, no clamp) | 94 / 16653 | 0.564 % | — |
+| smoothing only (k=2) | 28 / 16653 | 0.168 % | 3.4× |
+| smoothing + clamp (α=0.7, new default) | **8 / 16653** | **0.048 %** | **12×** |
+| smoothing + α=0.5 | 6 / 16653 | 0.036 % | 16× |
+| smoothing + α=0.3 | 5 / 16653 | 0.030 % | 19× |
 
-**Workaround still in use for callers:**
-The bundled
+The fix also flipped `test_all_element_volumes_positive` from xfail
+to pass on both 0.30 and 0.50 m element sizes — the residual 8
+elements have collapsed-but-not-inverted geometry.
+
+**Workaround still needed for callers:**
+The residual 8 elements still trip ANSYS at the `EN` command. The
+bundled
 [`examples/write_abaqus_solid_model.py`](../../examples/write_abaqus_solid_model.py)
-filters bad-Jacobian elements via `check_all_jacobians`; the Phase 5
-integration test mirrors this via `_filter_bad_jacobian_elements`.
-Still needed for the residual 28 elements.
+filters them via `check_all_jacobians`; the Phase 5 integration test
+mirrors this via `_filter_bad_jacobian_elements`. Until untangling
+lands the upstream filter is still required.
 
 **Reproducers (in CI):**
 - [`test_all_jacobians_positive`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
-  — aspirational strict test, `xfail strict=False`; flips green when
-  the residual 28 reach zero.
-- [`test_jacobian_failure_rate_under_0_5_percent`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
-  — regression bound, tightened from 2 % → 0.5 % after the smoothing fix.
+  — strict, `xfail strict=False`; flips green when untangling lands.
+- [`test_jacobian_failure_rate_under_0_1_percent`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
+  — regression bound, tightened from 2 % → 0.1 % after the combined fix.
 
-**Next step toward zero:**
-A post-extrusion repair pass. For each remaining bad brick, identify
-the most-twisted through-thickness edge and pull its top node back
-along that edge until Jacobian becomes positive. This is local (no
-ripple to neighbours) and matches the geometric intuition: at TE
-knife-edge bricks the layer is locally too thick relative to the
-shell-edge length, so locally shrink the layer.
+**Next step toward zero (the industry-standard untangling stage):**
+A post-extrusion variational / optimization-based smoother
+(Knupp/Freitag-style, Sandia's Mesquite library, or a custom
+gradient-descent on the inverse mean-ratio quality metric). For
+each remaining bad brick, perturb its corner nodes within tight
+topology-preserving bounds until Jacobian becomes positive. Local
+in scope, principled, and identical in spirit to what every
+commercial mesh-quality module does after extrusion.
 
 ---
 

@@ -145,23 +145,28 @@ def test_no_orphan_constraint_node_refs(element_size):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.xfail(
-    reason="Residual mesh_gen issue: even with the new normal-smoothing "
-           "pass in solidMeshFromShell (n_normal_smoothing_iter=2), "
-           "~28/16653 (0.17 %) elements on BAR0 at elementSize=0.5 / "
-           "layers=[1,1,1] retain non-positive Jacobian. All remaining "
-           "bad elements live in the HP_TE_FLAT region where the shell "
-           "mesh has aspect ratios > 15:1 (~0.49 m chordwise vs ~0.03 m "
-           "in the normal-to-TE direction). Even averaged-and-smoothed "
-           "normals can't reorient these knife-edge bricks. A post-"
-           "extrusion repair pass (or coarsening the shell at TE) would "
-           "be the next fix step. test_jacobian_failure_rate_under_0_5_"
-           "percent catches regressions of the smoothing pass itself.",
+    reason="Residual ~8/16653 (0.048 %) elements on BAR0 at elementSize=0.5 "
+           "/ layers=[1,1,1] retain non-positive Jacobian after BOTH the "
+           "industry-standard mesh-quality treatments now baked into "
+           "solidMeshFromShell:\n"
+           "  (1) Laplacian smoothing of per-node normals "
+           "(n_normal_smoothing_iter=2)\n"
+           "  (2) per-node adaptive layer-thickness clamping "
+           "(layer_thickness_cap_factor=0.7)\n"
+           "Together these drop the bad-Jacobian count 94 -> 8 (12x "
+           "reduction). The residual handful are in HP_TE_FLAT bricks "
+           "with shell aspect ratios > 15:1 AND extreme face skew that "
+           "neither smoothing nor clamping fully clears. A post-extrusion "
+           "untangling pass (e.g. Mesquite-style) or a TE-aware shell "
+           "remesher would be the proper next step.\n"
+           "test_jacobian_failure_rate_under_0_1_percent catches "
+           "regressions of either pass.",
     strict=False,
 )
 @pytest.mark.parametrize("element_size", ESIZES)
 def test_all_jacobians_positive(element_size):
     """Aspirational strict check: zero non-positive Jacobians. Currently
-    xfails on BAR0 — marker flips when post-extrusion repair lands."""
+    xfails on BAR0 — marker flips when untangling lands."""
     mesh = get_solid_mesh_cached(elementSize=element_size)
     failed = check_all_jacobians(mesh["nodes"], mesh["elements"])
     assert len(failed) == 0, (
@@ -171,16 +176,17 @@ def test_all_jacobians_positive(element_size):
 
 
 # Regression bound for the known issue above. Observed on BAR0 with
-# layerNumEls=[1,1,1] before/after the normal-smoothing fix:
-#   pre-fix  elementSize=0.50 : 94 / 16653 bad (0.564 %)
-#   post-fix elementSize=0.50 : 28 / 16653 bad (0.168 %, n_smooth=2 default)
-# Bound at 0.5 % gives ~3x headroom over current state while still
-# detecting if a future change loses the smoothing improvement entirely.
-_MAX_JACOBIAN_FAIL_RATE = 0.005
+# layerNumEls=[1,1,1] at each fix stage:
+#   legacy (no smoothing, no clamp)              : 94 / 16653 (0.564 %)
+#   smoothing only (n_smooth=2)                  : 28 / 16653 (0.168 %)
+#   smoothing + adaptive thickness (alpha=0.7)   :  8 / 16653 (0.048 %)
+# Bound at 0.1 % gives ~2x headroom while still detecting if either
+# pass regresses or is accidentally disabled.
+_MAX_JACOBIAN_FAIL_RATE = 0.001
 
 
 @pytest.mark.parametrize("element_size", ESIZES)
-def test_jacobian_failure_rate_under_0_5_percent(element_size):
+def test_jacobian_failure_rate_under_0_1_percent(element_size):
     """Regression bound on the known Jacobian-flip rate (see xfail above).
 
     A spike here means a mesh_gen change made extrusion worse. Tightening
@@ -196,16 +202,11 @@ def test_jacobian_failure_rate_under_0_5_percent(element_size):
     )
 
 
-@pytest.mark.xfail(
-    reason="Same root cause as test_all_jacobians_positive: the ~0.5% bad "
-           "Jacobian elements have negative or zero volume. Bound test "
-           "test_volume_failure_rate_under_0_5_percent catches regressions.",
-    strict=False,
-)
 @pytest.mark.parametrize("element_size", ESIZES)
 def test_all_element_volumes_positive(element_size):
-    """Aspirational strict check: every solid element has positive volume.
-    Currently xfails on BAR0 — marker flips when extruder is fixed."""
+    """Strict check: every solid element has positive volume. Passes
+    once the smoothing + adaptive-thickness combo lands; was xfail
+    against the legacy un-treated extruder."""
     mesh = get_solid_mesh_cached(elementSize=element_size)
     vols = get_element_volumes(mesh)["elVols"]
     non_positive = [(k, v) for k, v in vols.items() if not (v > 0)]
@@ -216,7 +217,7 @@ def test_all_element_volumes_positive(element_size):
 
 
 @pytest.mark.parametrize("element_size", ESIZES)
-def test_volume_failure_rate_under_0_5_percent(element_size):
+def test_volume_failure_rate_under_0_1_percent(element_size):
     """Regression bound on non-positive-volume rate — same bound as the
     Jacobian regression test (both stem from the same mesh_gen issue)."""
     mesh = get_solid_mesh_cached(elementSize=element_size)
