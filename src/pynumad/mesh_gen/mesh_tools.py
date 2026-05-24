@@ -124,6 +124,119 @@ def check_all_jacobians(nodes,elements):
         ei = ei + 1
     return failedEls
 
+
+def _check_element_jacobian(nodes, el):
+    """Single-element wrapper around check_jacobian — used by the
+    untangling pass to test one brick / wedge at a time without
+    rebuilding the per-element coordinate matrix in the caller."""
+    xC, yC, zC = [], [], []
+    for nd in el:
+        if nd > -1:
+            xC.append(nodes[nd, 0])
+            yC.append(nodes[nd, 1])
+            zC.append(nodes[nd, 2])
+    nn = len(xC)
+    if nn == 8:
+        etype = 'brick8'
+    elif nn == 6:
+        etype = 'wedge6'
+    else:
+        return True  # unknown — assume OK
+    return check_jacobian(np.array([xC, yC, zC]), etype)
+
+
+def untangle_solid_mesh(nodes, elements, max_iter=30,
+                        factor_schedule=(0.5, 0.3, 0.15, 0.05),
+                        verbose=False):
+    """Post-extrusion untangling pass for swept solid meshes.
+
+    Standard industry stage after smoothing + adaptive layer thickness:
+    iteratively repair the residual bad-Jacobian bricks/wedges by
+    pulling each element's TOP-face corners toward their corresponding
+    BOTTOM-face corners (pure through-thickness shrink), with a
+    neighbour-preservation guard so previously-good elements never
+    silently invert. Implements the targeted "node-pull" stage that
+    Mesquite-style optimizers do as a final pass.
+
+    Convention from ``Mesh3D.createSweptMesh``:
+      hex   — corners 0..3 are the bottom face (shell base layer),
+              4..7 the top face (extruded layer). Top corner k+4 sits
+              above bottom corner k.
+      wedge — bottom 0..2, top 3..5. Top corner k+3 above bottom k.
+
+    Algorithm:
+      For each iteration:
+        1. Identify bad-Jacobian elements via check_all_jacobians.
+        2. For each, try each shrink factor in ``factor_schedule``:
+             move top corners to bot + f * (top - bot).
+             accept the first factor where (a) the element becomes
+             good AND (b) no neighbour that was good before turns bad.
+        3. Stop when zero bad elements or no move accepted.
+
+    Returns
+    -------
+    new_nodes : np.ndarray
+        Repaired nodes array (copy; input unchanged).
+    n_remaining : int
+        Bad elements still failing after ``max_iter`` rounds.
+    n_iterations : int
+        Number of iterations actually run.
+
+    Performance
+    -----------
+    Bounded by ``max_iter * len(bad)``; for BAR0 at elementSize=0.5
+    after smoothing + clamp this is ~2 * 8 = 16 single-element
+    Jacobian checks plus per-node neighbour lookups (~200 ops total).
+    """
+    nodes = nodes.copy()
+    n = len(nodes)
+    node_to_els = [[] for _ in range(n)]
+    for ei in range(len(elements)):
+        for nid in elements[ei]:
+            if nid >= 0:
+                node_to_els[nid].append(ei)
+
+    for it in range(max_iter):
+        bad = check_all_jacobians(nodes, elements)
+        if not bad:
+            if verbose:
+                print(f'untangle: iter {it}: 0 bad — converged')
+            return nodes, 0, it
+        good_initial = set(range(len(elements))) - set(bad)
+        moved = 0
+        for ei in list(bad):
+            el = elements[ei]
+            is_wedge = (el[6] == -1)
+            top_idx = [3, 4, 5] if is_wedge else [4, 5, 6, 7]
+            bot_idx = [0, 1, 2] if is_wedge else [0, 1, 2, 3]
+            for factor in factor_schedule:
+                snapshot = {el[k]: nodes[el[k]].copy() for k in top_idx}
+                for ti, bi in zip(top_idx, bot_idx):
+                    nodes[el[ti]] = (nodes[el[bi]] +
+                                     factor * (nodes[el[ti]] - nodes[el[bi]]))
+                ok = _check_element_jacobian(nodes, el)
+                if ok:
+                    for ti in top_idx:
+                        for other_ei in node_to_els[el[ti]]:
+                            if (other_ei in good_initial and
+                                    not _check_element_jacobian(nodes, elements[other_ei])):
+                                ok = False
+                                break
+                        if not ok:
+                            break
+                if ok:
+                    moved += 1
+                    break
+                for nid, pos in snapshot.items():
+                    nodes[nid] = pos
+        if verbose:
+            print(f'untangle: iter {it}: bad={len(bad)} moved={moved}')
+        if moved == 0:
+            break
+    n_remaining = len(check_all_jacobians(nodes, elements))
+    return nodes, n_remaining, it + 1
+
+
 def get_element_volumes(meshData):
     elVols = dict()
     elMats = dict()

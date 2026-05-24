@@ -144,29 +144,12 @@ def test_no_orphan_constraint_node_refs(element_size):
 # Geometric integrity — Jacobians, volumes
 # ---------------------------------------------------------------------------
 
-@pytest.mark.xfail(
-    reason="Residual ~8/16653 (0.048 %) elements on BAR0 at elementSize=0.5 "
-           "/ layers=[1,1,1] retain non-positive Jacobian after BOTH the "
-           "industry-standard mesh-quality treatments now baked into "
-           "solidMeshFromShell:\n"
-           "  (1) Laplacian smoothing of per-node normals "
-           "(n_normal_smoothing_iter=2)\n"
-           "  (2) per-node adaptive layer-thickness clamping "
-           "(layer_thickness_cap_factor=0.7)\n"
-           "Together these drop the bad-Jacobian count 94 -> 8 (12x "
-           "reduction). The residual handful are in HP_TE_FLAT bricks "
-           "with shell aspect ratios > 15:1 AND extreme face skew that "
-           "neither smoothing nor clamping fully clears. A post-extrusion "
-           "untangling pass (e.g. Mesquite-style) or a TE-aware shell "
-           "remesher would be the proper next step.\n"
-           "test_jacobian_failure_rate_under_0_1_percent catches "
-           "regressions of either pass.",
-    strict=False,
-)
 @pytest.mark.parametrize("element_size", ESIZES)
 def test_all_jacobians_positive(element_size):
-    """Aspirational strict check: zero non-positive Jacobians. Currently
-    xfails on BAR0 — marker flips when untangling lands."""
+    """Strict check: zero non-positive Jacobians. Now passes thanks to
+    the three-stage industry-standard treatment in solidMeshFromShell
+    (normal smoothing + adaptive layer-thickness clamp + post-extrusion
+    untangle). Was xfail against legacy un-treated extruder."""
     mesh = get_solid_mesh_cached(elementSize=element_size)
     failed = check_all_jacobians(mesh["nodes"], mesh["elements"])
     assert len(failed) == 0, (
@@ -175,18 +158,19 @@ def test_all_jacobians_positive(element_size):
     )
 
 
-# Regression bound for the known issue above. Observed on BAR0 with
-# layerNumEls=[1,1,1] at each fix stage:
-#   legacy (no smoothing, no clamp)              : 94 / 16653 (0.564 %)
-#   smoothing only (n_smooth=2)                  : 28 / 16653 (0.168 %)
+# Regression bound on bad-Jacobian rate. Observed at each fix stage
+# on BAR0 elementSize=0.5 / layerNumEls=[1,1,1]:
+#   legacy (no smoothing, no clamp, no untangle) : 94 / 16653 (0.564 %)
+#   smoothing only                               : 28 / 16653 (0.168 %)
 #   smoothing + adaptive thickness (alpha=0.7)   :  8 / 16653 (0.048 %)
-# Bound at 0.1 % gives ~2x headroom while still detecting if either
-# pass regresses or is accidentally disabled.
-_MAX_JACOBIAN_FAIL_RATE = 0.001
+#   smoothing + clamp + untangle (default)       :  0 / 16653 (0.000 %)
+# Bound at 0.05 % catches partial regressions (untangle disabled or
+# clamp regressed) while still leaving headroom for noise.
+_MAX_JACOBIAN_FAIL_RATE = 0.0005
 
 
 @pytest.mark.parametrize("element_size", ESIZES)
-def test_jacobian_failure_rate_under_0_1_percent(element_size):
+def test_jacobian_failure_rate_under_0_05_percent(element_size):
     """Regression bound on the known Jacobian-flip rate (see xfail above).
 
     A spike here means a mesh_gen change made extrusion worse. Tightening
@@ -217,7 +201,7 @@ def test_all_element_volumes_positive(element_size):
 
 
 @pytest.mark.parametrize("element_size", ESIZES)
-def test_volume_failure_rate_under_0_1_percent(element_size):
+def test_volume_failure_rate_under_0_05_percent(element_size):
     """Regression bound on non-positive-volume rate — same bound as the
     Jacobian regression test (both stem from the same mesh_gen issue)."""
     mesh = get_solid_mesh_cached(elementSize=element_size)

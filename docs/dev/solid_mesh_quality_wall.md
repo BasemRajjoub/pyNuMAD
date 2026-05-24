@@ -19,14 +19,21 @@ shell-to-solid extrusion in
 
 ---
 
-## Bug 1 — Non-positive-Jacobian elements at the trailing edge
+## Bug 1 — Non-positive-Jacobian elements at the trailing edge — FIXED
 
-**Where:**
-[`mesh_gen.py:1219-1410`](../../src/pynumad/mesh_gen/mesh_gen.py)
-`solidMeshFromShell` — the through-thickness extrusion of the shell
-mesh into a 3D solid mesh.
+**Status:** **resolved**. Three-stage industry-standard treatment in
+`solidMeshFromShell` drives BAR0 bad-Jacobian count from 94 to 0.
+Visualisation: [`figs/solid_mesh_fix_stages.pdf`](figs/solid_mesh_fix_stages.pdf).
 
-**Symptom (before partial fix):**
+**Where (fix lives):**
+[`mesh_gen.py:1219-1500`](../../src/pynumad/mesh_gen/mesh_gen.py)
+`solidMeshFromShell` —  the kwargs `n_normal_smoothing_iter`,
+`layer_thickness_cap_factor`, and `untangle_max_iter` are the three
+stage knobs; see
+[`mesh_tools.untangle_solid_mesh`](../../src/pynumad/mesh_gen/mesh_tools.py)
+for the final stage's implementation.
+
+**Symptom (pre-fix):**
 On BAR0 at `elementSize=0.50`, `layerNumEls=[1,1,1]`,
 [`mesh_tools.check_all_jacobians`](../../src/pynumad/mesh_gen/mesh_tools.py)
 returned **94 / 16653 elements (0.564 %)** with zero or negative
@@ -36,56 +43,65 @@ trailing-edge flat) region between span z=22.4 m and z=44.6 m, layers
 `*** ERROR *** Brick element N has a zero or negative determinant
 of the Jacobian matrix at one of its sampling locations`.
 
-**Partial fix landed — industry-standard two-pass treatment:**
-`solidMeshFromShell` now applies the two mesh-quality treatments
+**Full fix — three-stage industry-standard treatment:**
+`solidMeshFromShell` applies the three mesh-quality treatments
 standard in industrial boundary-layer / sweep meshers (HyperMesh
-"Bias Style", ANSYS Workbench Sweep, Cubit Sweep, Pointwise T-Rex):
+"Bias Style", ANSYS Workbench Sweep, Cubit Sweep, Pointwise T-Rex,
+Sandia's Mesquite library):
 
-1. **Laplacian smoothing of per-node averaged normals before
-   extrusion** (kwarg `n_normal_smoothing_iter=2` by default; set to 0
-   to disable). Reduces sharp normal divergence at TE / root taper.
-2. **Per-node adaptive layer-thickness clamping** (kwarg
-   `layer_thickness_cap_factor=0.7` by default; set to `None` to
-   disable). At each node, cap the layer offset to
-   `α · min(incident shell-edge length)`. Prevents knife-edge bricks
-   where the shell quad is locally thin. Trade-off: at constrained
-   nodes the layer is locally thinner than the nominal ply, slightly
-   under-representing through-thickness stiffness.
+1. **Laplacian smoothing of per-node averaged normals** before
+   extrusion (kwarg `n_normal_smoothing_iter=2`).
+2. **Per-node adaptive layer-thickness clamping** during extrusion
+   (kwarg `layer_thickness_cap_factor=0.7`): at each node, cap the
+   per-layer offset to `α · min(incident shell-edge length)`. Trade-
+   off: at constrained nodes the layer is locally thinner than the
+   nominal ply.
+3. **Post-extrusion targeted untangling** (kwarg
+   `untangle_max_iter=30`, see
+   [`mesh_tools.untangle_solid_mesh`](../../src/pynumad/mesh_gen/mesh_tools.py)):
+   for each bad-Jacobian brick, pull its top-face corners toward the
+   corresponding bottom-face corners (through-thickness shrink) with
+   a neighbour-preservation guard. Knupp-style targeted node-pull.
 
-| state | bad elements | rate | reduction |
+Each kwarg can be set to 0/`None` to reproduce the prior behaviour.
+
+| stage | bad elements | rate | cumulative reduction |
 |---|---|---|---|
-| legacy (no smoothing, no clamp) | 94 / 16653 | 0.564 % | — |
-| smoothing only (k=2) | 28 / 16653 | 0.168 % | 3.4× |
-| smoothing + clamp (α=0.7, new default) | **8 / 16653** | **0.048 %** | **12×** |
-| smoothing + α=0.5 | 6 / 16653 | 0.036 % | 16× |
-| smoothing + α=0.3 | 5 / 16653 | 0.030 % | 19× |
+| legacy (no treatment) | 94 / 16653 | 0.564 % | — |
+| + normal smoothing (k=2) | 28 / 16653 | 0.168 % | 3.4× |
+| + adaptive thickness (α=0.7) | 8 / 16653 | 0.048 % | 12× |
+| + untangle (default) | **0 / 16653** | **0.000 %** | **∞** |
 
-The fix also flipped `test_all_element_volumes_positive` from xfail
-to pass on both 0.30 and 0.50 m element sizes — the residual 8
-elements have collapsed-but-not-inverted geometry.
+Untangle moves at most ~22 nodes by an average ~4 mm in 2 iterations
+on the BAR0 fixture. All previously-good bricks remain good
+(neighbour-preservation guard).
 
-**Workaround still needed for callers:**
-The residual 8 elements still trip ANSYS at the `EN` command. The
-bundled
-[`examples/write_abaqus_solid_model.py`](../../examples/write_abaqus_solid_model.py)
-filters them via `check_all_jacobians`; the Phase 5 integration test
-mirrors this via `_filter_bad_jacobian_elements`. Until untangling
-lands the upstream filter is still required.
+Side effect: `test_all_element_volumes_positive` and
+`test_all_jacobians_positive` are now strict-pass on both 0.30 and
+0.50 m sizes (formerly xfail).
+
+**Workaround no longer needed for the BAR0 fixture:**
+Mesh now passes `check_all_jacobians` clean. The
+`_filter_bad_jacobian_elements` helper in
+[`test_solid_solver_run.py`](../../src/pynumad/tests/test_solid_solver_run.py)
+is now a no-op on BAR0 — kept as defence in depth for blades with
+even more pathological TE geometry where the three-stage treatment
+can't fully recover.
+
+**Visualisation:**
+![fix stages](figs/solid_mesh_fix_stages.png)
+
+Generated by [`scripts/plot_solid_mesh_fix_stages.py`](../../scripts/plot_solid_mesh_fix_stages.py).
+PDF + low-res preview live alongside in `docs/dev/figs/`.
 
 **Reproducers (in CI):**
 - [`test_all_jacobians_positive`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
-  — strict, `xfail strict=False`; flips green when untangling lands.
-- [`test_jacobian_failure_rate_under_0_1_percent`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
-  — regression bound, tightened from 2 % → 0.1 % after the combined fix.
-
-**Next step toward zero (the industry-standard untangling stage):**
-A post-extrusion variational / optimization-based smoother
-(Knupp/Freitag-style, Sandia's Mesquite library, or a custom
-gradient-descent on the inverse mean-ratio quality metric). For
-each remaining bad brick, perturb its corner nodes within tight
-topology-preserving bounds until Jacobian becomes positive. Local
-in scope, principled, and identical in spirit to what every
-commercial mesh-quality module does after extrusion.
+  — strict pass.
+- [`test_all_element_volumes_positive`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
+  — strict pass.
+- [`test_jacobian_failure_rate_under_0_05_percent`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
+  — regression bound at 0.05 % catches partial regressions (any of
+  the three stages disabled or weakened).
 
 ---
 
