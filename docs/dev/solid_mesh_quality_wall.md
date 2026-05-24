@@ -19,46 +19,65 @@ shell-to-solid extrusion in
 
 ---
 
-## Bug 1 — ~0.5 % of extruded solid elements have non-positive Jacobian
+## Bug 1 — Non-positive-Jacobian elements at the trailing edge
 
 **Where:**
-[`mesh_gen.py:1219-1395`](../../src/pynumad/mesh_gen/mesh_gen.py)
+[`mesh_gen.py:1219-1410`](../../src/pynumad/mesh_gen/mesh_gen.py)
 `solidMeshFromShell` — the through-thickness extrusion of the shell
 mesh into a 3D solid mesh.
 
-**Symptom:**
-On the bundled BAR0 fixture at `elementSize=0.50` with
-`layerNumEls=[1,1,1]`,
+**Symptom (before partial fix):**
+On BAR0 at `elementSize=0.50`, `layerNumEls=[1,1,1]`,
 [`mesh_tools.check_all_jacobians`](../../src/pynumad/mesh_gen/mesh_tools.py)
-returns **94 / 16653 elements (0.564 %)** with zero or negative
-Jacobian determinant. First 10 failing element indices:
-`{6907, 6908, 7112, 7113, 7114, 7115, 7116, 7117, 7118, 7329}`.
-
-ANSYS R2023 rejects these at the `EN` command with
+returned **94 / 16653 elements (0.564 %)** with zero or negative
+Jacobian determinant. All 94 lived in the HP_TE_FLAT (high-pressure
+trailing-edge flat) region between span z=22.4 m and z=44.6 m, layers
+2 and 3. ANSYS R2023 rejects these at the `EN` command with
 `*** ERROR *** Brick element N has a zero or negative determinant
 of the Jacobian matrix at one of its sampling locations`.
 
-**Workaround in use:**
+**Partial fix landed:**
+`solidMeshFromShell` now runs a Laplacian smoothing pass over the
+per-node averaged normals before extrusion (kwarg
+`n_normal_smoothing_iter=2` by default; set to 0 to reproduce legacy
+behavior). The smoothing averages each node's normal with its
+ring-1 neighbours over 2 iterations, which reduces sharp divergence
+at the TE without significantly tilting layers in the bulk.
+
+| state | bad elements | rate |
+|---|---|---|
+| legacy (k=0) | 94 / 16653 | 0.564 % |
+| k=2 (new default) | **28 / 16653** | **0.168 %** |
+| k=5 | 21 / 16653 | 0.126 % |
+| k=10+ | 25-30 (asymptote) | ≥0.13 % |
+
+Smoothing alone asymptotes near 20 bad elements — beyond k=5 returns
+diminish and even worsen. The remaining elements have extreme
+in-plane aspect ratios (~16:1, e.g. element 7112: 0.49 m × 0.03 m)
+where the through-thickness brick is essentially a knife edge that
+flips for any small normal misalignment.
+
+**Workaround still in use for callers:**
 The bundled
 [`examples/write_abaqus_solid_model.py`](../../examples/write_abaqus_solid_model.py)
-calls `check_all_jacobians` and skips the failing elements before
-emitting Abaqus C3D8/C3D6 lines. The Phase 5 integration test mirrors
-this via `_filter_bad_jacobian_elements` — a band-aid, not a fix.
+filters bad-Jacobian elements via `check_all_jacobians`; the Phase 5
+integration test mirrors this via `_filter_bad_jacobian_elements`.
+Still needed for the residual 28 elements.
 
-**Reproducer (in CI):**
-[`test_all_jacobians_positive`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
-(`xfail strict=False`) +
-[`test_jacobian_failure_rate_under_2_percent`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
-(regression bound at 2 % so this can't silently get worse).
+**Reproducers (in CI):**
+- [`test_all_jacobians_positive`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
+  — aspirational strict test, `xfail strict=False`; flips green when
+  the residual 28 reach zero.
+- [`test_jacobian_failure_rate_under_0_5_percent`](../../src/pynumad/tests/test_shell_to_solid_expansion.py)
+  — regression bound, tightened from 2 % → 0.5 % after the smoothing fix.
 
-**Likely cause:**
-The extruder pushes each shell node along its averaged-normal vector
-([`mesh_gen.py:1262-1285`](../../src/pynumad/mesh_gen/mesh_gen.py)).
-At the BAR0 root transition the normals of adjacent shell regions
-diverge sharply over short distances; the per-layer offset overshoots
-the next layer, producing folded or self-intersecting bricks. The
-shell mesh itself is clean at this size — the wall is in the
-**extrusion step only**.
+**Next step toward zero:**
+A post-extrusion repair pass. For each remaining bad brick, identify
+the most-twisted through-thickness edge and pull its top node back
+along that edge until Jacobian becomes positive. This is local (no
+ripple to neighbours) and matches the geometric intuition: at TE
+knife-edge bricks the layer is locally too thick relative to the
+shell-edge length, so locally shrink the layer.
 
 ---
 

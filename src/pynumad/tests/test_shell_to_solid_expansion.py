@@ -145,18 +145,23 @@ def test_no_orphan_constraint_node_refs(element_size):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.xfail(
-    reason="Known mesh_gen issue: solidMeshFromShell produces ~0.5% bad "
-           "Jacobian elements on BAR0 at elementSize=0.5 with layers=[1,1,1]. "
-           "The Abaqus example script (examples/write_abaqus_solid_model.py) "
-           "filters these via check_all_jacobians before writing. Fixing the "
-           "extruder is out of scope for the writer/test task. The bound "
-           "test test_jacobian_failure_rate_under_2_percent catches regressions.",
+    reason="Residual mesh_gen issue: even with the new normal-smoothing "
+           "pass in solidMeshFromShell (n_normal_smoothing_iter=2), "
+           "~28/16653 (0.17 %) elements on BAR0 at elementSize=0.5 / "
+           "layers=[1,1,1] retain non-positive Jacobian. All remaining "
+           "bad elements live in the HP_TE_FLAT region where the shell "
+           "mesh has aspect ratios > 15:1 (~0.49 m chordwise vs ~0.03 m "
+           "in the normal-to-TE direction). Even averaged-and-smoothed "
+           "normals can't reorient these knife-edge bricks. A post-"
+           "extrusion repair pass (or coarsening the shell at TE) would "
+           "be the next fix step. test_jacobian_failure_rate_under_0_5_"
+           "percent catches regressions of the smoothing pass itself.",
     strict=False,
 )
 @pytest.mark.parametrize("element_size", ESIZES)
 def test_all_jacobians_positive(element_size):
     """Aspirational strict check: zero non-positive Jacobians. Currently
-    xfails on BAR0 — marker flips when mesh_gen extruder is fixed."""
+    xfails on BAR0 — marker flips when post-extrusion repair lands."""
     mesh = get_solid_mesh_cached(elementSize=element_size)
     failed = check_all_jacobians(mesh["nodes"], mesh["elements"])
     assert len(failed) == 0, (
@@ -165,17 +170,17 @@ def test_all_jacobians_positive(element_size):
     )
 
 
-# Regression bound for the known issue above. Observed on BAR0 2026-05-23
-# with layerNumEls=[1,1,1] (one fresh run each):
-#   elementSize=0.50 : 94 / 16653 bad (0.564 %)
-#   elementSize=0.30 : measured at first run
-# Bound at 2 % gives headroom for measurement noise but catches a real
-# regression (e.g. a future shell-mesh change that worsens extrusion).
-_MAX_JACOBIAN_FAIL_RATE = 0.02
+# Regression bound for the known issue above. Observed on BAR0 with
+# layerNumEls=[1,1,1] before/after the normal-smoothing fix:
+#   pre-fix  elementSize=0.50 : 94 / 16653 bad (0.564 %)
+#   post-fix elementSize=0.50 : 28 / 16653 bad (0.168 %, n_smooth=2 default)
+# Bound at 0.5 % gives ~3x headroom over current state while still
+# detecting if a future change loses the smoothing improvement entirely.
+_MAX_JACOBIAN_FAIL_RATE = 0.005
 
 
 @pytest.mark.parametrize("element_size", ESIZES)
-def test_jacobian_failure_rate_under_2_percent(element_size):
+def test_jacobian_failure_rate_under_0_5_percent(element_size):
     """Regression bound on the known Jacobian-flip rate (see xfail above).
 
     A spike here means a mesh_gen change made extrusion worse. Tightening
@@ -194,7 +199,7 @@ def test_jacobian_failure_rate_under_2_percent(element_size):
 @pytest.mark.xfail(
     reason="Same root cause as test_all_jacobians_positive: the ~0.5% bad "
            "Jacobian elements have negative or zero volume. Bound test "
-           "test_volume_failure_rate_under_2_percent catches regressions.",
+           "test_volume_failure_rate_under_0_5_percent catches regressions.",
     strict=False,
 )
 @pytest.mark.parametrize("element_size", ESIZES)
@@ -211,7 +216,7 @@ def test_all_element_volumes_positive(element_size):
 
 
 @pytest.mark.parametrize("element_size", ESIZES)
-def test_volume_failure_rate_under_2_percent(element_size):
+def test_volume_failure_rate_under_0_5_percent(element_size):
     """Regression bound on non-positive-volume rate — same bound as the
     Jacobian regression test (both stem from the same mesh_gen issue)."""
     mesh = get_solid_mesh_cached(elementSize=element_size)
