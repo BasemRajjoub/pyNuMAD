@@ -40,12 +40,29 @@ def bar0_mesh():
 # physical components.
 EXPECTED_NODE_CC = {tag: 1 for tag in mc.CHORD_GROUP_TAGS if tag != "SW"}
 
+# TE_FLAT strips may be fully absorbed into the adjacent TE_REINF by the
+# thin-flat merge in mesh_gen (``_station_region_plan``): when a flat's
+# chord is below ``elementSize / _MERGE_TE_FLAT_AR`` it would otherwise
+# produce a high-aspect-ratio sliver that warps under NLGEOM, so it is
+# folded into TE_REINF. On coarse meshes (e.g. BAR0 at elementSize=0.5)
+# the entire flat can be absorbed, so HP/LP_TE_FLAT may legitimately be
+# absent. When present, they must still be a single component.
+TE_FLAT_TAGS = {"HP_TE_FLAT", "LP_TE_FLAT"}
+
 
 def test_all_chord_groups_are_node_connected(bar0_mesh):
-    """Every material zone (except SW) should be a single 'plate'."""
+    """Every material zone (except SW) should be a single 'plate'.
+
+    TE_FLAT groups are allowed to be absent (fully merged into TE_REINF);
+    when present they must be a single component. The merge's continuity
+    is still enforced here because the absorbing TE_REINF group is itself
+    asserted to be exactly one node-connected component.
+    """
     sizes = mc.all_group_components(bar0_mesh, min_shared_nodes=1)
     for tag, n_expected in EXPECTED_NODE_CC.items():
         cc = sizes.get(tag, [])
+        if tag in TE_FLAT_TAGS and not cc:
+            continue  # thin flat fully absorbed into TE_REINF — valid
         assert cc, f"{tag} missing from mesh"
         assert len(cc) == n_expected, (
             f"{tag}: expected {n_expected} node-connected component(s), "

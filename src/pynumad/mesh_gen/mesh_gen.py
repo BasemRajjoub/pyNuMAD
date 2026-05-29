@@ -378,6 +378,138 @@ def _emit_adhesive_volume(
     return shellData
 
 
+# When a TE_FLAT chord (the blunt trailing-edge strip) is thinner than
+# ``elementSize / _MERGE_TE_FLAT_AR`` it produces a lone 1-element-wide
+# spanwise strip whose aspect ratio (span/chord) exceeds this value.
+# Those slivers pass the static AR<20 check but warp past ANSYS's
+# element-formulation limit under NLGEOM at large tip deflection. When
+# the threshold is crossed the flat is folded into the adjacent TE_REINF
+# region (see _station_region_plan), widening that region's chord so the
+# sliver disappears. See docs/dev/TODO_shell_mesh_pipeline.md #1.
+_MERGE_TE_FLAT_AR = 4.0
+
+
+def _shell_kp(splineXi, splineYi, splineZi, stPt, cols):
+    """Build the 16-point quad3 control array for one (non-merged) shell
+    patch from four consecutive chord columns.
+
+    Parameters
+    ----------
+    stPt : int
+        Spanwise start row; the patch spans rows ``stPt .. stPt+3``.
+    cols : tuple[int, int, int, int]
+        The four chord control columns ``(stSp, stSp+1, stSp+2, stSp+3)``.
+
+    Returns
+    -------
+    (16, 3) ndarray
+        quad3 keypoints in the canonical order: 4 corners, then the 12
+        edge/interior points (identical to what the station loop has
+        always emitted).
+    """
+    c0, c1, c2, c3 = cols
+
+    def P(dr, c):
+        return [splineXi[stPt + dr, c], splineYi[stPt + dr, c], splineZi[stPt + dr, c]]
+
+    return np.array([
+        P(0, c0), P(0, c3), P(3, c3), P(3, c0),
+        P(0, c1), P(0, c2), P(1, c3), P(2, c3),
+        P(3, c2), P(3, c1), P(2, c0), P(1, c0),
+        P(1, c1), P(1, c2), P(2, c2), P(2, c1),
+    ])
+
+
+def _shell_kp_merged(splineXi, splineYi, splineZi, stPt, c_lo, c_hi):
+    """Build the 16-point quad3 control array for a *merged* TE_FLAT+TE_REINF
+    patch spanning chord columns ``c_lo .. c_hi`` (7 columns).
+
+    The merged region's chord controls are resampled at four **arc-length**
+    fractions (0, 1/3, 2/3, 1) of the chord polyline through columns
+    ``c_lo .. c_hi`` for each spanwise row. This is essential: picking
+    every-other spline column directly (e.g. 0,2,4,6) gives control points
+    bunched in the thin flat and sparse in the wide reinf, which the cubic
+    map turns into high-AR slivers. Arc-length resampling produces an
+    evenly-proportioned patch.
+
+    The chord endpoints (fraction 0 -> column ``c_lo``; fraction 1 ->
+    column ``c_hi``) land exactly on the original spline columns, so the
+    TE-most closure edge and the outboard edge shared with TE_PANEL are
+    unchanged — mesh continuity is preserved. Only interior controls move.
+    """
+    rows = (stPt, stPt + 1, stPt + 2, stPt + 3)
+    fracs = (0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0)
+    cols = np.arange(c_lo, c_hi + 1)
+    grid = np.empty((4, 4, 3))  # [row_idx, chord_frac_idx, xyz]
+    for ri, r in enumerate(rows):
+        pts = np.stack(
+            [splineXi[r, cols], splineYi[r, cols], splineZi[r, cols]], axis=1
+        )
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        s = np.concatenate([[0.0], np.cumsum(seg)])
+        total = s[-1]
+        for fi, f in enumerate(fracs):
+            tgt = f * total
+            grid[ri, fi] = [np.interp(tgt, s, pts[:, k]) for k in range(3)]
+
+    def G(ri, fi):
+        return grid[ri, fi]
+
+    return np.array([
+        G(0, 0), G(0, 3), G(3, 3), G(3, 0),
+        G(0, 1), G(0, 2), G(1, 3), G(2, 3),
+        G(3, 2), G(3, 1), G(2, 0), G(1, 0),
+        G(1, 1), G(1, 2), G(2, 2), G(2, 1),
+    ])
+
+
+def _station_region_plan(splineXi, splineYi, splineZi, stPt, elementSize,
+                         enable_merge=True):
+    """Return the per-station region list as ``(stack_index, spec)`` tuples.
+
+    ``spec`` is either ``("cols", (c0, c1, c2, c3))`` for a normal region
+    (four consecutive chord columns) or ``("merge", c_lo, c_hi)`` for a
+    TE_REINF region that has absorbed an adjacent thin TE_FLAT.
+
+    Normally this is the 12 chord regions, each consuming three spline
+    columns. When a TE_FLAT chord is thinner than
+    ``elementSize / _MERGE_TE_FLAT_AR`` the flat is folded into the
+    adjacent TE_REINF: the flat's own region is dropped and the reinf
+    region spans both. The TE-most chord column (0 for HP, 36 for LP) is
+    preserved, so the trailing-edge closure edge is unchanged.
+
+    ``enable_merge`` is False on the solid-seed path (``forSolid``): the
+    thin-flat merge is a shell-mesh fix for NLGEOM, and the solid pipeline
+    has its own post-extrusion untangler that the merged TE seed would
+    otherwise disrupt (it regresses solid-element Jacobians). Solid seeds
+    therefore keep the original 12-region layout.
+    """
+    def chord_len(ca, cb):
+        pa = np.array([splineXi[stPt, ca], splineYi[stPt, ca], splineZi[stPt, ca]])
+        pb = np.array([splineXi[stPt, cb], splineYi[stPt, cb], splineZi[stPt, cb]])
+        return float(np.linalg.norm(pb - pa))
+
+    thresh = elementSize / _MERGE_TE_FLAT_AR
+    hp_merge = enable_merge and 0.0 < chord_len(0, 3) < thresh
+    lp_merge = enable_merge and 0.0 < chord_len(33, 36) < thresh
+
+    plan = []
+    if hp_merge:
+        plan.append((1, ("merge", 0, 6)))            # HP_TE_REINF absorbs HP_TE_FLAT
+    else:
+        plan.append((0, ("cols", (0, 1, 2, 3))))     # HP_TE_FLAT
+        plan.append((1, ("cols", (3, 4, 5, 6))))     # HP_TE_REINF
+    for j in range(2, 10):                           # middle regions unchanged
+        b = 3 * j
+        plan.append((j, ("cols", (b, b + 1, b + 2, b + 3))))
+    if lp_merge:
+        plan.append((10, ("merge", 30, 36)))         # LP_TE_REINF absorbs LP_TE_FLAT
+    else:
+        plan.append((10, ("cols", (30, 31, 32, 33))))  # LP_TE_REINF
+        plan.append((11, ("cols", (33, 34, 35, 36))))  # LP_TE_FLAT
+    return plan
+
+
 def _compute_edge_nels(shellKp, elementSize, region_name="", force_match_opposite=True):
     """Compute the four per-edge element counts of a shell patch from its
     corner keypoints and the target element size.
@@ -805,125 +937,56 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
         #     stSec = 1
         #     endSec = 10
         #     stSp = 3
-        stSec = 0
-        endSec = 11
-        stSp = 0
-        for j in range(stSec, endSec + 1):
-            shellKp = np.array(
-                [
-                    [splineXi[stPt, stSp], splineYi[stPt, stSp], splineZi[stPt, stSp]],
-                    [
-                        splineXi[stPt, stSp + 3],
-                        splineYi[stPt, stSp + 3],
-                        splineZi[stPt, stSp + 3],
-                    ],
-                    [
-                        splineXi[stPt + 3, stSp + 3],
-                        splineYi[stPt + 3, stSp + 3],
-                        splineZi[stPt + 3, stSp + 3],
-                    ],
-                    [
-                        splineXi[stPt + 3, stSp],
-                        splineYi[stPt + 3, stSp],
-                        splineZi[stPt + 3, stSp],
-                    ],
-                    [
-                        splineXi[stPt, stSp + 1],
-                        splineYi[stPt, stSp + 1],
-                        splineZi[stPt, stSp + 1],
-                    ],
-                    [
-                        splineXi[stPt, stSp + 2],
-                        splineYi[stPt, stSp + 2],
-                        splineZi[stPt, stSp + 2],
-                    ],
-                    [
-                        splineXi[stPt + 1, stSp + 3],
-                        splineYi[stPt + 1, stSp + 3],
-                        splineZi[stPt + 1, stSp + 3],
-                    ],
-                    [
-                        splineXi[stPt + 2, stSp + 3],
-                        splineYi[stPt + 2, stSp + 3],
-                        splineZi[stPt + 2, stSp + 3],
-                    ],
-                    [
-                        splineXi[stPt + 3, stSp + 2],
-                        splineYi[stPt + 3, stSp + 2],
-                        splineZi[stPt + 3, stSp + 2],
-                    ],
-                    [
-                        splineXi[stPt + 3, stSp + 1],
-                        splineYi[stPt + 3, stSp + 1],
-                        splineZi[stPt + 3, stSp + 1],
-                    ],
-                    [
-                        splineXi[stPt + 2, stSp],
-                        splineYi[stPt + 2, stSp],
-                        splineZi[stPt + 2, stSp],
-                    ],
-                    [
-                        splineXi[stPt + 1, stSp],
-                        splineYi[stPt + 1, stSp],
-                        splineZi[stPt + 1, stSp],
-                    ],
-                    [
-                        splineXi[stPt + 1, stSp + 1],
-                        splineYi[stPt + 1, stSp + 1],
-                        splineZi[stPt + 1, stSp + 1],
-                    ],
-                    [
-                        splineXi[stPt + 1, stSp + 2],
-                        splineYi[stPt + 1, stSp + 2],
-                        splineZi[stPt + 1, stSp + 2],
-                    ],
-                    [
-                        splineXi[stPt + 2, stSp + 2],
-                        splineYi[stPt + 2, stSp + 2],
-                        splineZi[stPt + 2, stSp + 2],
-                    ],
-                    [
-                        splineXi[stPt + 2, stSp + 1],
-                        splineYi[stPt + 2, stSp + 1],
-                        splineZi[stPt + 2, stSp + 1],
-                    ],
-                ]
-            )
+        # Per-station chord regions. Normally the 12 fixed regions
+        # (HP_TE_FLAT .. LP_TE_FLAT), but on the shell path thin TE_FLAT
+        # strips near the tip are folded into the adjacent TE_REINF to
+        # avoid high-aspect-ratio slivers that warp under NLGEOM. The
+        # merge is disabled for solid seeds (forSolid) — see
+        # _station_region_plan.
+        plan = _station_region_plan(
+            splineXi, splineYi, splineZi, stPt, elementSize,
+            enable_merge=(not forSolid),
+        )
+        for stack_j, spec in plan:
+            if spec[0] == "merge":
+                shellKp = _shell_kp_merged(
+                    splineXi, splineYi, splineZi, stPt, spec[1], spec[2]
+                )
+            else:
+                shellKp = _shell_kp(splineXi, splineYi, splineZi, stPt, spec[1])
             # Per-edge element counts: see _compute_edge_nels for the trapezoidal-
             # patch caveat. The Sandia commented hint `nEl1 = secNel[j]` /
             # `nEl3 = secNel[j]` suggests opposite chord edges should share a
             # precomputed per-stack count; current code derives them per cell.
             nEl = _compute_edge_nels(
-                shellKp, elementSize, region_name=stacks[j, i].name
+                shellKp, elementSize, region_name=stacks[stack_j, i].name
             )
             if nEl is None:
                 # Degenerate patch (e.g. zero-chord at root/tip cylinder).
                 # _compute_edge_nels already logged the skip.
-                stSp = stSp + 3
                 continue
 
             bladeSurf.addShellRegion(
                 "quad3",
                 shellKp,
                 nEl,
-                name=stacks[j, i].name,
+                name=stacks[stack_j, i].name,
                 elType="quad",
                 meshMethod="structured",
             )
-            outShES.add(stacks[j,i].name)
+            outShES.add(stacks[stack_j, i].name)
             newSec = dict()
             newSec["type"] = "shell"
             layup = list()
-            for pg in stacks[j, i].plygroups:
+            for pg in stacks[stack_j, i].plygroups:
                 totThick = 0.001*pg.thickness * pg.nPlies
                 ply = [pg.materialid, totThick, pg.angle]
                 layup.append(ply)
             newSec["layup"] = layup
-            newSec["elementSet"] = stacks[j, i].name
+            newSec["elementSet"] = stacks[stack_j, i].name
             newSec["xDir"] = (shellKp[3,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[1,:])
             newSec["xyDir"] = (shellKp[1,:] - shellKp[0,:]) + (shellKp[2,:] - shellKp[3,:])
             secList.append(newSec)
-            stSp = stSp + 3
         stPt = stPt + 3
 
     ## Shift the appropriate splines if the mesh is for a solid model seed

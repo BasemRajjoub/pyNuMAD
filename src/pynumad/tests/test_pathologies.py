@@ -182,10 +182,15 @@ def test_twisted_blade_does_not_introduce_jflips(shell_mesh_only):
     # sign-flip ambiguity in an eigenvector direction.
     delta = abs(a_tip - a_root) % 180.0
     delta = min(delta, 180.0 - delta)
-    # BAR0 has a few degrees of structural twist; this is just a sanity
-    # check that some twist made it through the mesher. The test does
-    # NOT introduce extra twist.
-    assert delta < 25.0, (
-        f"chord twist root -> tip = {delta:.1f}° which is large; "
-        f"unexpected for BAR0"
+    # BAR0 has real structural twist; this is a sanity check that some
+    # twist made it through the mesher (lower bound) and that the value
+    # is not absurd (upper bound). The proxy is the PCA principal axis of
+    # each band's node cloud, which is sensitive to the tip node
+    # distribution: the thin-TE_FLAT merge in mesh_gen removes the most
+    # trailing tip nodes, rotating the tip principal axis by a few degrees
+    # (the blade's actual twist is unchanged). The bound is set with
+    # margin for that proxy shift; it does NOT introduce extra twist.
+    assert 5.0 < delta < 35.0, (
+        f"chord twist root -> tip = {delta:.1f}° outside the sanity band "
+        f"(expected meaningful but not absurd twist for BAR0)"
     )
