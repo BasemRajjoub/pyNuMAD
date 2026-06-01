@@ -911,6 +911,61 @@ def _write_ansys_adhesive(fid, blade, meshData):
     fid.write("\nallsel\n")
 
 
+def _quadratic_midside_nodes(nodes, elements, first_id):
+    """Build SHELL281 mid-side nodes natively (no reliance on ANSYS EMID).
+
+    For every non-degenerate quad, a node is placed at the straight
+    midpoint of each of its four edges; nodes are shared between elements
+    that share an edge, yielding a conforming 8-node quadratic mesh. The
+    midpoint placement is identical to what ``EMID,ADD`` would produce, so
+    there is no accuracy difference — the point is *coverage*: ``EMID,ADD``
+    silently skips some boundary elements (observed on the IEA-22 root
+    TE_FLAT and shear-web tip), leaving SHELL281 elements with dropped
+    mid-side nodes and aborting the solve. Generating them in Python
+    guarantees every element edge gets its node.
+
+    Parameters
+    ----------
+    nodes : (N, 3) ndarray
+        Corner node coordinates (0-indexed).
+    elements : (M, >=4) ndarray
+        Element corner connectivity (0-indexed). Degenerate quads
+        (fewer than 4 unique corners) are skipped — they are not written
+        as elements either.
+    first_id : int
+        1-indexed id to assign to the first new mid-side node (typically
+        ``nnodes + 1``).
+
+    Returns
+    -------
+    edge_mid : dict[tuple[int, int], int]
+        Maps a sorted 0-indexed corner-node pair ``(a, b)`` to the
+        1-indexed mid-side node id on that edge.
+    mid_nodes : list[tuple[int, float, float, float]]
+        ``(id, x, y, z)`` for each mid-side node, in ascending id order.
+    """
+    edge_mid: dict[tuple[int, int], int] = {}
+    mid_nodes: list[tuple[int, float, float, float]] = []
+    nid = first_id
+    for iEl in range(elements.shape[0]):
+        conn = elements[iEl, :4]
+        if np.unique(conn).size != 4:
+            continue
+        a, b, c, d = (int(x) for x in conn)
+        for u, v in ((a, b), (b, c), (c, d), (d, a)):
+            key = (u, v) if u < v else (v, u)
+            if key not in edge_mid:
+                edge_mid[key] = nid
+                mid_nodes.append((
+                    nid,
+                    0.5 * (nodes[u, 0] + nodes[v, 0]),
+                    0.5 * (nodes[u, 1] + nodes[v, 1]),
+                    0.5 * (nodes[u, 2] + nodes[v, 2]),
+                ))
+                nid += 1
+    return edge_mid, mid_nodes
+
+
 def write_ansys_shell_model(blade, meshData, config):
     """ WRITE_SHELL7 Generate the ANSYS input file that creates the blade
 
@@ -1232,6 +1287,15 @@ def write_ansys_shell_model(blade, meshData, config):
     for iNode in range(nnodes):
         fid.write('n, %i, %f, %f, %f\n' % \
             (iNode+1,nodes[iNode,0],nodes[iNode,1],nodes[iNode,2]))
+    # SHELL281: generate mid-side nodes natively (see _quadratic_midside_nodes).
+    # Avoids EMID,ADD which silently skips some boundary elements.
+    quad281 = (config["elementType"] == '281')
+    edge_mid = {}
+    if quad281:
+        edge_mid, mid_nodes = _quadratic_midside_nodes(nodes, elements, nnodes + 1)
+        fid.write('\n! DEFINE MIDSIDE NODES (SHELL281 quadratic) ============\n')
+        for (mid, mx, my, mz) in mid_nodes:
+            fid.write('n, %i, %f, %f, %f\n' % (mid, mx, my, mz))
     #Set the element Type
     if '281' == config["elementType"]:
         fid.write('type, 11\n')
@@ -1245,14 +1309,20 @@ def write_ansys_shell_model(blade, meshData, config):
     fid.write('\n! DEFINE ELEMENTS =======================================\n')
     for iElement in range(nelements):
         if np.unique(elements[iElement,:]).size == 4:
-            elem_data = (
-                elements[iElement,0]+1,
-                elements[iElement,1]+1,
-                elements[iElement,2]+1,
-                elements[iElement,3]+1,
-                iElement+1
-            )
-            fid.write('e, %i, %i, %i, %i  !Element %i \n' % elem_data)
+            a0, b0, c0, d0 = (int(elements[iElement, k]) for k in range(4))
+            if quad281:
+                # 8-node SHELL281: corners I,J,K,L then mid-sides M(I-J),
+                # N(J-K), O(K-L), P(L-I) — matches ANSYS node ordering.
+                def _m(u, v):
+                    return edge_mid[(u, v) if u < v else (v, u)]
+                fid.write('e, %i,%i,%i,%i,%i,%i,%i,%i  !Element %i \n' % (
+                    a0+1, b0+1, c0+1, d0+1,
+                    _m(a0, b0), _m(b0, c0), _m(c0, d0), _m(d0, a0),
+                    iElement+1,
+                ))
+            else:
+                fid.write('e, %i, %i, %i, %i  !Element %i \n' % (
+                    a0+1, b0+1, c0+1, d0+1, iElement+1))
         else:
             dup.append(iElement)
         

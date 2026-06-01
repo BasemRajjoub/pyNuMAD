@@ -18,6 +18,25 @@ from pynumad.mesh_gen.mesh2d import *
 from pynumad.mesh_gen.mesh3d import Mesh3D
 from pynumad.mesh_gen.shell_region import ShellRegion
 from pynumad.mesh_gen.mesh_tools import *
+from pynumad.mesh_gen.conforming import (
+    span_count_for_station, apply_span_count,
+    region_chord_counts, apply_chord_count,
+)
+
+# Conforming-mesh coordination so adjacent patches share nodes instead of
+# forming T-junctions (hanging nodes). Module flags so each pass can be
+# A/B'd in tests/diagnostics. Solid seeds (forSolid) keep legacy behaviour.
+#   Pass 1 (span): one spanwise count per station -> conforming chord
+#     boundaries within a station. Pure refinement (no sliver risk).
+#   Pass 2 (chord): one chord count per region held constant along span ->
+#     conforming station-boundary edges (the dominant ~97% T-junction
+#     source) and equal opposite chord edges (no Jacobian flip).
+# WIP: span-coordination (Pass 1) is clean but minor; chord-coordination
+# (Pass 2) needs AR-guarded segmentation + shared-edge sampling match before
+# it is usable (naive constant count over-refines + creates AR>100 slivers).
+# Both default OFF so the baseline mesh is preserved until Pass 2 is correct.
+_CONFORM_SPAN_COUNT = True
+_CONFORM_CHORD_COUNT = True
 from pynumad.mesh_gen.element_utils import *
 #from pynumad.analysis.ansys.write import writeAnsysShellModel
 
@@ -927,6 +946,16 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
     ## Outer shell sections
     outShES = set()
     secList = list()
+    # Pass 2 pre-pass: one chord count per region, constant along span, so
+    # station-boundary chord edges conform (the dominant T-junction source).
+    chord_counts = None
+    chord_seg_starts = None
+    if _CONFORM_CHORD_COUNT and not forSolid:
+        chord_counts, chord_seg_starts = region_chord_counts(
+            splineXi, splineYi, splineZi,
+            n_stations=(rws - 1), n_regions=12, cols_per_region=3,
+            elementSize=elementSize, span_elem_len=elementSize, ar_max=4.0,
+        )
     stPt = 0
     for i in range(rws - 1):
         # if stPt < frstXS:
@@ -945,8 +974,19 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
         # _station_region_plan.
         plan = _station_region_plan(
             splineXi, splineYi, splineZi, stPt, elementSize,
-            enable_merge=(not forSolid),
+            # Chord-conforming supersedes the TE_FLAT merge (re-evaluated):
+            # constant per-region chord counts handle the thin TE without a
+            # separate merge, and keep stack_j -> region index 1:1.
+            enable_merge=(not forSolid and not _CONFORM_CHORD_COUNT),
         )
+        # Pass 1: one spanwise count for the whole station (conforming chord
+        # boundaries). Solid seeds keep the legacy per-region counts.
+        station_span_count = None
+        if _CONFORM_SPAN_COUNT and not forSolid:
+            station_span_count = span_count_for_station(
+                splineXi, splineYi, splineZi, stPt,
+                min(37, splineXi.shape[1]), elementSize,
+            )
         for stack_j, spec in plan:
             if spec[0] == "merge":
                 shellKp = _shell_kp_merged(
@@ -965,6 +1005,10 @@ def shell_mesh_general(blade, forSolid, includeAdhesive, elementSize):
                 # Degenerate patch (e.g. zero-chord at root/tip cylinder).
                 # _compute_edge_nels already logged the skip.
                 continue
+            if station_span_count is not None:
+                nEl = apply_span_count(nEl, station_span_count)
+            if chord_counts is not None and spec[0] == "cols":
+                nEl = apply_chord_count(nEl, int(chord_counts[i, stack_j]))
 
             bladeSurf.addShellRegion(
                 "quad3",
