@@ -347,28 +347,53 @@ def _truncate_elem_axis(arr: np.ndarray, n_elem: int, name: str
 
 def _truncate_node_axis(arr: np.ndarray, n_node: int, name: str
                          ) -> np.ndarray:
-    """Same tolerance as elem axis but for node-keyed tables.
+    """Reconcile an ANSYS node-keyed table with the mesh-dict node count.
 
-    Currently pyNuMAD and ANSYS agree on node count, but mirror the
-    elem-axis logic so a future deck-writer change does not break the
-    pipeline.
+    Two directions are tolerated:
+
+    * **Surplus** (ANSYS > mesh): trailing all-zero phantom rows are
+      dropped (mirrors the element-axis logic).
+
+    * **Deficit** (ANSYS < mesh): ``nummrg,all`` merged coincident nodes
+      (e.g. duplicate nodes the conforming T-junction mesher places at
+      shell/web interfaces) and ``numcmp,node`` renumbered the survivors.
+      ANSYS then reports fewer nodes than the pyNuMAD mesh dict. The
+      node-keyed tables (``disp``, ``mode_shape``) are AUXILIARY fields:
+      the field-PCE pipeline reads only per-element stress/strain/svm,
+      which are unaffected (elements are not renumbered by numcmp,node).
+      We zero-pad the deficit so the HDF5 nodal-field shape stays
+      consistent with ``n_node``, and warn. A hard cap distinguishes a
+      benign coincident-node merge from genuine extraction corruption.
     """
     extra = arr.shape[0] - n_node
-    if extra < 0:
-        raise ValueError(
-            f"{name}: expected at least {n_node} rows, got {arr.shape[0]}"
-        )
     if extra == 0:
         return arr
-    tail = arr[n_node:, 1:]
-    if not np.allclose(tail, 0.0):
+    if extra > 0:
+        tail = arr[n_node:, 1:]
+        if not np.allclose(tail, 0.0):
+            raise ValueError(
+                f"{name}: {extra} trailing row(s) present and are not all "
+                f"zero - extraction probably out of sync with mesh"
+            )
+        print(f"[field_io] {name}: dropped {extra} trailing phantom "
+              f"node row(s)")
+        return arr[:n_node]
+
+    # extra < 0: ANSYS returned fewer nodes than the mesh dict.
+    deficit = -extra
+    cap = max(16, int(0.005 * n_node))  # >0.5% missing ⇒ real corruption
+    if deficit > cap:
         raise ValueError(
-            f"{name}: {extra} trailing row(s) present and are not all "
-            f"zero - extraction probably out of sync with mesh"
+            f"{name}: ANSYS returned {arr.shape[0]} rows but mesh has "
+            f"{n_node} nodes (deficit {deficit} > cap {cap}). This is too "
+            f"large for coincident-node merging — likely a real mesh / "
+            f"extraction mismatch."
         )
-    print(f"[field_io] {name}: dropped {extra} trailing phantom "
-          f"node row(s)")
-    return arr[:n_node]
+    print(f"[field_io] {name}: ANSYS node count {arr.shape[0]} < mesh "
+          f"{n_node} (deficit {deficit}); nummrg merged coincident nodes. "
+          f"Zero-padding auxiliary nodal field (unused by field-PCE).")
+    pad = np.zeros((deficit, arr.shape[1]), dtype=arr.dtype)
+    return np.concatenate([arr, pad], axis=0)
 
 
 def _parse_field_files(
